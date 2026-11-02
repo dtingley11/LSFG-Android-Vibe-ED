@@ -55,6 +55,7 @@ object FramegenBridge {
 
     private var instance = 0L
 
+    @Synchronized
     fun createSession(
         width: Int, height: Int,
         flowScale: Float, performance: Boolean
@@ -68,27 +69,32 @@ object FramegenBridge {
         }
     }
 
+    @Synchronized
     fun writeSource(srcAhb: Long, slot: Int) {
         if (instance == 0L) return
         try { nativeWriteSource(instance, srcAhb, slot) } catch (_: Throwable) {}
     }
 
+    @Synchronized
     fun dispatch(total: Int) {
         if (instance == 0L) return
         try { nativeDispatch(instance, total) } catch (_: Throwable) {}
     }
 
+    @Synchronized
     fun acquire() {
         if (instance == 0L) return
         try { nativeAcquire(instance) } catch (_: Throwable) {}
     }
 
     /** Acquire the next generated frame and blit it into the shared dst AHB. */
+    @Synchronized
     fun acquireToDst(dstAhb: Long) {
         if (instance == 0L) return
         try { nativeAcquireToDst(instance, dstAhb) } catch (_: Throwable) {}
     }
 
+    @Synchronized
     fun idle() {
         if (instance == 0L) return
         try { nativeIdle(instance) } catch (_: Throwable) {}
@@ -107,6 +113,7 @@ object FramegenBridge {
      * Used by the pipeline stats report to show real generated-frame rates.
      * Returns "0,0,0" when the native lib is not loaded.
      */
+    @Synchronized
     fun getStats(): Triple<Long, Long, Long> {
         if (instance == 0L) return Triple(0L, 0L, 0L)
         return try {

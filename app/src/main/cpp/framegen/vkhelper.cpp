@@ -352,116 +352,73 @@ vk::UniqueImage vkhelper::createImage(
 }
 
 #if defined(__ANDROID__)
-vk::UniqueImage vkhelper::createImageFromAhb(
+vkhelper::AhbImage vkhelper::createImageFromAhb(
     const vk::detail::DispatchLoaderDynamic& dld,
     const vk::Device& device,
     const void* buffer,
     vk::ImageUsageFlags usage
 ) {
     const auto* ahb{static_cast<const AHardwareBuffer*>(buffer)};
+    if (!ahb)
+        throw std::runtime_error("cannot import a null AHardwareBuffer");
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb, &desc);
     if (desc.width == 0 || desc.height == 0)
         throw std::runtime_error("AHardwareBuffer_describe returned an empty buffer");
 
-    // Map the AHardwareBuffer pixel format to a Vulkan format.
-    vk::Format format = vk::Format::eR8G8B8A8Unorm;
-    switch (desc.format) {
-        case AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:
-            format = vk::Format::eR8G8B8A8Unorm;
-            break;
-        case AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM:
-            format = vk::Format::eA2B10G10R10UnormPack32;
-            break;
-        case AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT:
-            format = vk::Format::eR16G16B16A16Sfloat;
-            break;
-        case AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM:
-            format = vk::Format::eR8G8B8Unorm;
-            break;
-        default:
-            break;
-    }
-
-    const vk::Extent2D extent{
-        static_cast<uint32_t>(desc.width),
-        static_cast<uint32_t>(desc.height)
-    };
-
-    // Create the image for AHB import with TRANSFER usage for blits.
-    //
-    // IMPORTANT: do NOT create the image with an OPAQUE_FD external handle
-    // type (external=false). The AHB-backed gralloc memory on Android is the
-    // ANDROID_HARDWARE_BUFFER handle type, not an opaque fd. Requiring
-    // OPAQUE_FD (external=true) forces the memory type to be fd-exportable,
-    // which AHB-backed memory often is not, so vkBindImageMemory fails with
-    // VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003). The image becomes
-    // external purely through VkImportAndroidHardwareBufferInfoANDROID below
-    // (chained into the allocation), which is the portable AHB import path and
-    // the one that works on this device's Adreno driver (see the WSI presenter
-    // import, which uses a plain VkImageCreateInfo with no external handle
-    // types and succeeds).
-    auto image{createImage(
-        dld,
-        device,
-        extent,
-        format,
-        1,
-        usage,
-        false
-    )};
-
-    // Query which memory type bits the AHardwareBuffer supports and pick one that is
-    // also usable by this image.
-    //
-    // Universal-safety guard: the AHB import depends on the
-    // VK_ANDROID_external_memory_android_hardware_buffer device extension. If the
-    // device did not enable it, the dispatch-loader function pointer is NULL and
-    // calling it is a NULL-call SIGSEGV (the exact crash that killed the app on
-    // Adreno). Verify the pointer is resolved before using it.
     auto getAhbProps{dld.vkGetAndroidHardwareBufferPropertiesANDROID};
-    if (!getAhbProps) {
-        throw std::runtime_error(
-            "device lacks vkGetAndroidHardwareBufferPropertiesANDROID; enable "
-            "VK_ANDROID_external_memory_android_hardware_buffer on the device");
-    }
+    if (!getAhbProps)
+        throw std::runtime_error("device lacks vkGetAndroidHardwareBufferPropertiesANDROID");
 
-    // sType MUST be set to the correct value; a zero-initialized struct has
-    // sType = VK_STRUCTURE_TYPE_UNKNOWN, which strict drivers (Adreno) reject or
-    // mis-handle when querying buffer properties. Use the C struct since the raw
-    // PFN from the dispatch loader expects the C type.
+    VkAndroidHardwareBufferFormatPropertiesANDROID formatProps{};
+    formatProps.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
     VkAndroidHardwareBufferPropertiesANDROID props{};
     props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+    props.pNext = &formatProps;
     if (getAhbProps(static_cast<VkDevice>(device), ahb, &props) != VK_SUCCESS)
         throw std::runtime_error("vkGetAndroidHardwareBufferPropertiesANDROID failed");
+    if (formatProps.format == VK_FORMAT_UNDEFINED)
+        throw std::runtime_error("AHardwareBuffer format cannot be blitted as a Vulkan image");
+    if (!props.memoryTypeBits)
+        throw std::runtime_error("AHardwareBuffer has no importable memory type");
 
-    const auto requirements{device.getImageMemoryRequirements(*image, dld)};
-    // The AHardwareBuffer import must use a memory type that is both usable by the image
-    // and supported by the buffer. Prefer the lowest such index.
-    const uint32_t usable{static_cast<uint32_t>(requirements.memoryTypeBits) & props.memoryTypeBits};
-    const uint32_t typeBits{usable ? usable : static_cast<uint32_t>(requirements.memoryTypeBits)};
+    const vk::ExternalMemoryImageCreateInfo externalInfo{
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eAndroidHardwareBufferANDROID
+    };
+    const vk::ImageCreateInfo imageInfo{
+        .pNext = &externalInfo,
+        .imageType = vk::ImageType::e2D,
+        .format = static_cast<vk::Format>(formatProps.format),
+        .extent = {desc.width, desc.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = desc.layers,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = usage
+    };
+    AhbImage imported;
+    imported.image = device.createImageUnique(imageInfo, nullptr, dld);
+
     uint32_t memoryTypeIndex = 0;
-    for (uint32_t i = 0; i < 64; ++i) {
-        if (typeBits & (1u << i)) {
-            memoryTypeIndex = i;
-            break;
-        }
-    }
+    while (!(props.memoryTypeBits & (1u << memoryTypeIndex)))
+        ++memoryTypeIndex;
 
-    auto* ahbMutable{const_cast<AHardwareBuffer*>(ahb)};
+    // AHB imports require a dedicated image allocation using the queried AHB size.
+    // Image memory requirements cannot be queried before binding AHB memory.
+    const vk::MemoryDedicatedAllocateInfo dedicatedInfo{
+        .image = *imported.image
+    };
     const vk::ImportAndroidHardwareBufferInfoANDROID importInfo{
-        .buffer = ahbMutable
+        .pNext = &dedicatedInfo,
+        .buffer = const_cast<AHardwareBuffer*>(ahb)
     };
     const vk::MemoryAllocateInfo allocInfo{
         .pNext = &importInfo,
-        .allocationSize = requirements.size,
+        .allocationSize = props.allocationSize,
         .memoryTypeIndex = memoryTypeIndex
     };
-    auto allocation{device.allocateMemoryUnique(allocInfo, nullptr, dld)};
-
-    device.bindImageMemory(*image, *allocation, 0, dld);
-
-    return image;
+    imported.memory = device.allocateMemoryUnique(allocInfo, nullptr, dld);
+    device.bindImageMemory(*imported.image, *imported.memory, 0, dld);
+    return imported;
 }
 #endif
 

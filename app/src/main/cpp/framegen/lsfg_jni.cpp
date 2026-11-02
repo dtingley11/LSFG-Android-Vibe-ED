@@ -45,15 +45,15 @@ namespace {
         vk::Queue queue{};
         uint32_t qfi{0};
 
-        // Imported destination AHardwareBuffers (dst AHB ptr -> VkImage), cached so the
-        // fixed presenter pool is imported once each.
-        std::unordered_map<uintptr_t, vk::Image> dstImages;
+        // Keep the pool alive until its command buffers have been freed.
+        vk::UniqueCommandPool blitPool;
+        vk::UniqueFence blitFence;
+
+        // Cached imports own both the image and its backing allocation.
+        std::unordered_map<uintptr_t, vkhelper::AhbImage> dstImages;
         // Pre-recorded blits: dst AHB ptr -> command buffer that copies the pipeline
         // output image into that imported destination image.
-        std::unordered_map<uintptr_t, vk::CommandBuffer> dstBlits;
-
-        vk::CommandPool blitPool{};
-        vk::Fence blitFence{};
+        std::unordered_map<uintptr_t, vk::UniqueCommandBuffer> dstBlits;
 
         std::mutex lock;
     };
@@ -69,16 +69,13 @@ namespace {
         st.queue.submit({{
             .commandBufferCount = 1,
             .pCommandBuffers = &cmdbuf
-        }}, st.blitFence, dld);
-        if (st.device.waitForFences(st.blitFence, VK_TRUE, UINT64_MAX, dld) != vk::Result::eSuccess) {
+        }}, *st.blitFence, dld);
+        if (st.device.waitForFences(*st.blitFence, VK_TRUE, UINT64_MAX, dld) != vk::Result::eSuccess) {
             throw std::runtime_error("framegen blit wait failed");
         }
-        st.device.resetFences(st.blitFence, dld);
+        st.device.resetFences(*st.blitFence, dld);
     }
 
-    // Ensure a pre-recorded command buffer exists that blits the imported source AHB
-    // into the requested layer of the pipeline's external input image (cached by
-    // (src AHB ptr, layer)).
     // Import a source AHB, blit it into the requested pipeline input layer, wait for
     // completion, then release the one-shot import. Source AHBs are one-shot (captured,
     // blitted, then closed by the producer), so no import cache is kept (avoids leaks).
@@ -89,7 +86,7 @@ namespace {
 
         // Transition the imported source to a general layout (ready to blit from).
         {
-            auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, st.blitPool);
+            auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, *st.blitPool);
             auto fence = vkhelper::createFence(dld, st.device);
             vk::ImageMemoryBarrier ib{
                 .sType = vk::StructureType::eImageMemoryBarrier,
@@ -100,7 +97,7 @@ namespace {
                 .newLayout = vk::ImageLayout::eGeneral,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = *srcImage,
+                .image = *srcImage.image,
                 .subresourceRange = vk::ImageSubresourceRange{ vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 }
             };
             cmdbuf->begin({ .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit }, dld);
@@ -127,7 +124,7 @@ namespace {
 
         // Blit the imported source into the pipeline input layer, synchronously.
         {
-            auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, st.blitPool);
+            auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, *st.blitPool);
             cmdbuf->begin({ .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit }, dld);
 
             vk::ImageMemoryBarrier inBarrier{
@@ -154,7 +151,7 @@ namespace {
 
             vkhelper::blitImage(
                 dld, *cmdbuf,
-                *srcImage, 0,
+                *srcImage.image, 0,
                 inImage, layer,
                 inExtent
             );
@@ -163,14 +160,13 @@ namespace {
             st.queue.submit({{
                 .commandBufferCount = 1,
                 .pCommandBuffers = &*cmdbuf
-            }}, st.blitFence, dld);
-            if (st.device.waitForFences(st.blitFence, VK_TRUE, UINT64_MAX, dld) != vk::Result::eSuccess)
+            }}, *st.blitFence, dld);
+            if (st.device.waitForFences(*st.blitFence, VK_TRUE, UINT64_MAX, dld) != vk::Result::eSuccess)
                 throw std::runtime_error("src blit wait failed");
-            st.device.resetFences(st.blitFence, dld);
+            st.device.resetFences(*st.blitFence, dld);
         }
 
-        // Release the one-shot import now that the blit has completed.
-        st.device.destroyImage(*srcImage, nullptr, dld);
+        // The one-shot import and its memory are released together after completion.
     }
 
     // Ensure a destination AHardwareBuffer is imported (cached by pointer) and
@@ -180,13 +176,13 @@ namespace {
         const uintptr_t key{reinterpret_cast<uintptr_t>(ahb)};
         const auto it{st.dstImages.find(key)};
         if (it != st.dstImages.end())
-            return it->second;
+            return *it->second.image;
 
         auto image = vkhelper::createImageFromAhb(dld, st.device, ahb);
 
         // Transition to general (ready to be the blit destination).
         {
-            auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, st.blitPool);
+            auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, *st.blitPool);
             auto fence = vkhelper::createFence(dld, st.device);
             vk::ImageMemoryBarrier ib{
                 .sType = vk::StructureType::eImageMemoryBarrier,
@@ -197,7 +193,7 @@ namespace {
                 .newLayout = vk::ImageLayout::eGeneral,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = *image,
+                .image = *image.image,
                 .subresourceRange = vk::ImageSubresourceRange{ vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 }
             };
             cmdbuf->begin({ .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit }, dld);
@@ -219,8 +215,9 @@ namespace {
                 throw std::runtime_error("dst AHB transition failed");
         }
 
-        st.dstImages.emplace(key, *image);
-        return *image;
+        const auto handle = *image.image;
+        st.dstImages.emplace(key, std::move(image));
+        return handle;
     }
 
     // Ensure a pre-recorded command buffer exists that blits the pipeline's external
@@ -230,14 +227,15 @@ namespace {
         const uintptr_t key{reinterpret_cast<uintptr_t>(dstAhb)};
         const auto it{st.dstBlits.find(key)};
         if (it != st.dstBlits.end())
-            return it->second;
+            return *it->second;
 
         auto dstImage = ensureDstImage(st, dstAhb);
         auto outImage = st.context->pipeline().getExternalOutputs().front().image;
         auto outExtent = st.context->pipeline().getExternalOutputs().front().extent;
 
-        auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, st.blitPool);
-        cmdbuf->begin({ .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit }, dld);
+        auto cmdbuf = vkhelper::createCommandBuffer(dld, st.device, *st.blitPool);
+        // This cached command buffer is resubmitted after each completed fence wait.
+        cmdbuf->begin(vk::CommandBufferBeginInfo{}, dld);
 
         // The pipeline's output image is written by compute; make it transfer-readable.
         vk::ImageMemoryBarrier outBarrier{
@@ -270,8 +268,9 @@ namespace {
         );
         cmdbuf->end(dld);
 
-        st.dstBlits.emplace(key, *cmdbuf);
-        return *cmdbuf;
+        const auto handle = *cmdbuf;
+        st.dstBlits.emplace(key, std::move(cmdbuf));
+        return handle;
     }
 
 } // namespace
@@ -286,7 +285,7 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeInit(JNIEnv* env, jclass, jstri
         std::string dllStr = dll;
         env->ReleaseStringUTFChars(dllPath, dll);
 
-        auto* st = new JniState();
+        auto st = std::make_unique<JniState>();
         st->instance = std::make_unique<lsfgvk::Instance>(
             "", std::filesystem::path(dllStr), allowFP16 == JNI_TRUE, false,
             [](const std::string& msg) { FLOG("%s", msg.c_str()); }
@@ -299,7 +298,7 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeInit(JNIEnv* env, jclass, jstri
         st->qfi = vk.qfi;
 
         FLOG("framegen instance created, dll=%s", dllStr.c_str());
-        return reinterpret_cast<jlong>(st);
+        return reinterpret_cast<jlong>(st.release());
     } catch (const std::exception& e) {
         FLOGE("nativeInit failed: %s", e.what());
         return 0;
@@ -331,8 +330,8 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeCreateSession(
         );
 
         auto& dld{*st->dld};
-        st->blitPool = *vkhelper::createCommandPool(dld, st->device, st->qfi);
-        st->blitFence = *vkhelper::createFence(dld, st->device);
+        st->blitPool = vkhelper::createCommandPool(dld, st->device, st->qfi);
+        st->blitFence = vkhelper::createFence(dld, st->device);
         // Source/destination AHBs (and their blit command buffers) are imported
         // lazily on the first writeSource/acquireToDst for each buffer.
 
@@ -368,7 +367,9 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeDispatch(
     auto* st = fromJni(handle);
     if (!st || !st->context) return;
     try {
-        st->context->dispatch(static_cast<uint32_t>(total));
+        // Source uploads complete on this queue before dispatch; there is no
+        // external fd-based producer to signal the context's sync semaphore.
+        st->context->dispatch(static_cast<uint32_t>(total), true);
         g_fgDispatches++;
     } catch (const std::exception& e) {
         FLOGE("nativeDispatch failed: %s", e.what());
@@ -381,7 +382,7 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeAcquire(
     auto* st = fromJni(handle);
     if (!st || !st->context) return;
     try {
-        st->context->acquire();
+        st->context->acquire(true);
     } catch (const std::exception& e) {
         FLOGE("nativeAcquire failed: %s", e.what());
     }
@@ -399,7 +400,9 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeAcquireToDst(
         const void* dst = reinterpret_cast<const void*>(dstAhbPtr);
 
         // Generate the next frame (into the pipeline's external output image).
-        st->context->acquire();
+        // The destination blit and its fence wait run on the same queue, so no
+        // external consumer semaphore is needed between generated frames.
+        st->context->acquire(true);
 
         // Blit the generated frame into the presenter's destination AHB (importing /
         // recording the blit on first use for this buffer), synchronously.
@@ -428,20 +431,15 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeDestroy(
     JNIEnv* env, jclass, jlong handle) {
     auto* st = fromJni(handle);
     if (!st) return;
-    st->context.reset();
     auto& dld{*st->dld};
-    // Release any imported destination AHB images before the device goes away.
-    for (auto& [key, image] : st->dstImages)
-        if (image)
-            st->device.destroyImage(image, nullptr, dld);
-    st->dstImages.clear();
-    if (st->blitFence) st->device.destroyFence(st->blitFence, nullptr, dld);
-    if (st->blitPool) st->device.destroyCommandPool(st->blitPool, nullptr, dld);
-    st->instance.reset();
+    try { st->device.waitIdle(dld); }
+    catch (const std::exception& e) { FLOGE("framegen shutdown wait failed: %s", e.what()); }
     FLOG("framegen session stats: srcWritten=%llu dispatches=%llu framesAcquired=%llu",
         (unsigned long long)g_fgSrcWritten.load(),
         (unsigned long long)g_fgDispatches.load(),
         (unsigned long long)g_fgFramesAcquired.load());
+    // RAII members release command buffers, imports, fence and pool before the
+    // context and instance. Each Vulkan handle is destroyed exactly once.
     delete st;
 }
 
