@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: CC-BY-NC-ND-4.0 */
 
 #include "vkhelper.hpp"
+#include "perf_metrics.h"
 
 #include <algorithm>
 #include <array>
@@ -358,6 +359,7 @@ vkhelper::AhbImage vkhelper::createImageFromAhb(
     const void* buffer,
     vk::ImageUsageFlags usage
 ) {
+    lsfgperf::Scope timing(lsfgperf::Import);
     const auto* ahb{static_cast<const AHardwareBuffer*>(buffer)};
     if (!ahb)
         throw std::runtime_error("cannot import a null AHardwareBuffer");
@@ -416,7 +418,10 @@ vkhelper::AhbImage vkhelper::createImageFromAhb(
         .allocationSize = props.allocationSize,
         .memoryTypeIndex = memoryTypeIndex
     };
-    imported.memory = device.allocateMemoryUnique(allocInfo, nullptr, dld);
+    {
+        lsfgperf::Scope allocationTiming(lsfgperf::Allocate);
+        imported.memory = device.allocateMemoryUnique(allocInfo, nullptr, dld);
+    }
     device.bindImageMemory(*imported.image, *imported.memory, 0, dld);
     return imported;
 }

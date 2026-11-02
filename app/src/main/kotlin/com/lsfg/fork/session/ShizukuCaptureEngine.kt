@@ -1,5 +1,7 @@
 package com.lsfg.fork.session
 
+import com.lsfg.fork.capture.PipelineStats
+
 import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
@@ -279,6 +281,15 @@ class ShizukuCaptureEngine(
 
         override fun onError(message: String?) {
             errorListener?.onError(message ?: "Unknown Shizuku capture error")
+        }
+
+        override fun onCaptureMetrics(startedNs: Long, captureNs: Long, commandNs: Long,
+            readNs: Long, decodeNs: Long, copyNs: Long, backend: String?) {
+            PipelineStats.record("capture", captureNs)
+            if (commandNs >= 0) PipelineStats.record("screenshotCommand", commandNs)
+            if (readNs >= 0) PipelineStats.record("fileRead", readNs)
+            if (decodeNs >= 0) PipelineStats.record("decode", decodeNs)
+            if (copyNs >= 0) PipelineStats.record("pixelCopy", copyNs)
         }
 
         override fun onFrameMetrics(timestampNs: Long, frameTimeNs: Long, pacingJitterNs: Long) {

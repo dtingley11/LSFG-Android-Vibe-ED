@@ -62,6 +62,7 @@ class ShizukuCaptureUserService : IShizukuCaptureService.Stub() {
         var frameLogCount = 0
         while (running.get()) {
             val started = SystemClock.uptimeMillis()
+            val captureStartedNs = System.nanoTime()
             val hb = runCatching { capture.captureHardwareBuffer() }
                 .onFailure {
                     Log.w(TAG, "captureHardwareBuffer failed", it)
@@ -79,6 +80,8 @@ class ShizukuCaptureUserService : IShizukuCaptureService.Stub() {
                 val pacingJitterNs = if (frameTimeNs > 0L) kotlin.math.abs(frameTimeNs - targetPeriodNs) else 0L
                 lastFrameNs = timestampNs
                 try {
+                    callback.onCaptureMetrics(captureStartedNs, timestampNs - captureStartedNs,
+                        -1, -1, -1, -1, "screenCapture")
                     callback.onFrameMetrics(timestampNs, frameTimeNs, pacingJitterNs)
                     callback.onFrame(hb, timestampNs)
                 } catch (t: Throwable) {

@@ -182,33 +182,46 @@ class ShizukuCaptureEngineAdapter(private val ctx: Context) {
     }
 }
 
-private var statsLastReportMs: Long = System.currentTimeMillis()
-private var statsLastPresented: Long = 0L
-private var statsLastGenerated: Long = 0L
+private var statsLastReportNs = 0L
+private var statsSessionId = -1L
+private val acquiredRate = com.lsfg.fork.performance.RateMeter()
+private val submittedRate = com.lsfg.fork.performance.RateMeter()
+private val generatedRate = com.lsfg.fork.performance.RateMeter()
+private val presentedRate = com.lsfg.fork.performance.RateMeter()
 
-/**
- * Log one line of pipeline telemetry from the shared [PipelineStats] counters.
- * Called by whichever per-second stats loop is active (root/shizuku adapter or
- * SessionManager's session reporter). Rates use elapsed wall time, not the
- * configured target.
- */
+/** Rates count acquired buffers and completed GPU copies/present requests, not unique game frames or scanout. */
+@Synchronized
 internal fun reportPipelineStats(tag: String = "lsfg-pipeline") {
-    val now = System.currentTimeMillis()
-    val dt = (now - statsLastReportMs) / 1000f
-    if (dt < 0.5f) return
-    statsLastReportMs = now
-    val acquiredFps = PipelineStats.acquired.get() / dt
-    val submittedFps = PipelineStats.submitted.get() / dt
-    // Generated rate from the framegen native counter (actual blit completions).
-    val generatedTotal = try { com.lsfg.fork.framegen.FramegenBridge.getStats().third } catch (_: Throwable) { 0L }
-    val generatedFps = (generatedTotal - statsLastGenerated) / dt
-    statsLastGenerated = generatedTotal
-    val presented = try { WsiBridge.framesPresented() } catch (_: Throwable) { 0L }
-    val presentedFps = (presented - statsLastPresented) / dt
-    statsLastPresented = presented
-    Log.i(tag, String.format(
-        "pipeline capture=%.1f submitted=%.1f generated=%.1f presented=%.1f (presented total %d) dropped=%d errors=%d",
-        acquiredFps, submittedFps, generatedFps, presentedFps, presented,
-        PipelineStats.dropped.get(), PipelineStats.errors.get()
-    ))
+    val now = System.nanoTime()
+    if (statsSessionId != PipelineStats.sessionId.get()) {
+        statsSessionId = PipelineStats.sessionId.get()
+        statsLastReportNs = now
+        acquiredRate.reset(PipelineStats.acquired.get())
+        submittedRate.reset(PipelineStats.submitted.get())
+        generatedRate.reset(com.lsfg.fork.framegen.FramegenBridge.getStats().third)
+        presentedRate.reset(WsiBridge.framesPresented())
+        return
+    }
+    val dt = (now - statsLastReportNs) / 1e9
+    if (dt < .5) return
+    statsLastReportNs = now
+    val generated = com.lsfg.fork.framegen.FramegenBridge.getStats().third
+    val presented = WsiBridge.framesPresented()
+    val source = PipelineStats.sourceIntervals.summary()
+    val runtime = Runtime.getRuntime()
+    val heapMiB = (runtime.totalMemory() - runtime.freeMemory()) / 1048576
+    Log.i(tag, String.format(java.util.Locale.US,
+        "pipeline acquired=%.1f submitted=%.1f generated=%.1f presentRequests=%.1f total=%d " +
+            "sourceIntervalMs[p50=%.2f,p95=%.2f,p99=%.2f] queue=%d dropped=%d errors=%d allocations=%d heapMiB=%d nativeHeapMiB=%d",
+        acquiredRate.sample(PipelineStats.acquired.get(), dt),
+        submittedRate.sample(PipelineStats.submitted.get(), dt),
+        generatedRate.sample(generated, dt), presentedRate.sample(presented, dt), presented,
+        source.p50, source.p95, source.p99, WsiBridge.queueSize(),
+        PipelineStats.dropped.get(), PipelineStats.errors.get(), PipelineStats.allocations.get(), heapMiB,
+        android.os.Debug.getNativeHeapAllocatedSize() / 1048576))
+    val timings = PipelineStats.stages.entries.sortedBy { it.key }.joinToString(" ") { (name, window) ->
+        val v = window.summary()
+        String.format(java.util.Locale.US, "%s[n=%d,p50=%.2f,p95=%.2f,p99=%.2f]", name, v.count, v.p50, v.p95, v.p99)
+    }
+    Log.i(tag, "timingMs $timings native=${com.lsfg.fork.framegen.FramegenBridge.performanceStats()} wsi=${WsiBridge.performanceStats()}")
 }

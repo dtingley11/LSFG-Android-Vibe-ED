@@ -539,6 +539,7 @@ class SessionManager : ViewModel() {
         val slot = (capturedFrameIdx % 2)
         val m = if (multiplier < 1) 1 else multiplier
 
+        val processingStart = System.nanoTime()
         FramegenBridge.writeSource(srcAhbPtr, slot)
         FramegenBridge.dispatch(m)
 
@@ -554,6 +555,7 @@ class SessionManager : ViewModel() {
             produced++
         }
         capturedFrameIdx++
+        PipelineStats.record("processing", System.nanoTime() - processingStart)
         return produced
     }
 

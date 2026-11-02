@@ -13,6 +13,8 @@ object WsiBridge {
     private external fun nativeStart(windowPtr: Long, width: Int, height: Int, targetFps: Float)
     private external fun nativeStop()
     private external fun nativeIsRunning(): Boolean
+    private external fun nativePerformanceStats(): String
+    fun performanceStats(): String = try { nativePerformanceStats() } catch (_: Throwable) { "unavailable" }
     private external fun nativeSetPaused(paused: Boolean)
     private external fun nativeSetTargetFps(fps: Float)
 
@@ -28,7 +30,7 @@ object WsiBridge {
     /** Number of frames currently queued for presentation (backpressure monitor). */
     external fun nativeQueueSize(): Int
 
-    /** Total frames handed to vkQueuePresentKHR (honest pipeline self-test). */
+    /** Successful present requests; physical display completion is not measured. */
     external fun nativeFramesPresented(): Long
 
     /**

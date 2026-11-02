@@ -12,6 +12,7 @@
 #include "volk.h"
 #include "lsfg_display.h"
 #include "jnifile_log.h"
+#include "perf_metrics.h"
 
 #include <algorithm>
 #include <atomic>
@@ -180,8 +181,8 @@ namespace {
         bool gpuFailure{false};
         VkCommandBuffer pendingCmdbuf{};
 
-        float targetFps{60.0f};
-        uint64_t framesPresented{0};
+        std::atomic<float> targetFps{60.0f};
+        std::atomic<uint64_t> framesPresented{0};
         bool constructed{false};
     };
 
@@ -601,11 +602,12 @@ namespace {
     }
 
     void presentLoop() {
+        int64_t lastPresented = 0;
         using namespace std::chrono_literals;
         while (g_presenter.running) {
             // Pop a source frame (non-blocking-ish, with a short timeout so the
             // loop can also service 'paused' and shutdown promptly).
-            int waitMs = std::max(1, static_cast<int>(1000.0 / g_presenter.targetFps));
+            int waitMs = std::max(1, static_cast<int>(1000.0 / g_presenter.targetFps.load()));
             uintptr_t frame = lsfgdisplay::pop(waitMs);
             if (!frame) {
                 if (g_presenter.paused) std::this_thread::sleep_for(5ms);
@@ -781,7 +783,9 @@ namespace {
                 pi.pSwapchains = chains;
                 pi.pImageIndices = indices;
                 // A failed present must not be counted as a presented frame.
+                const auto presentStart = lsfgperf::nowNs();
                 VkResult pr = vkQueuePresentKHR(g_presenter.queue, &pi);
+                lsfgperf::metrics.record(lsfgperf::PresentCall, lsfgperf::nowNs() - presentStart);
                 if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) {
                     WLOGE("vkQueuePresentKHR=%d", (int)pr);
                 }
@@ -828,7 +832,12 @@ namespace {
                 // The fence wait above guarantees the GPU finished reading the
                 // source, so the popped frame's reference can go now.
                 releasePoppedFrame();
-                g_presenter.framesPresented++;
+                if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) {
+                    const auto now = lsfgperf::nowNs();
+                    if (lastPresented) lsfgperf::metrics.record(lsfgperf::PresentInterval, now - lastPresented);
+                    lastPresented = now;
+                    g_presenter.framesPresented++;
+                }
             } catch (const std::exception& e) {
                 WLOGE("present loop: %s", e.what());
                 std::this_thread::sleep_for(10ms);
@@ -941,6 +950,7 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeStart(JNIEnv* env, jclass, jlong windowPt
         g_presenter.targetFps = targetFps > 1.0f ? targetFps : 60.0f;
         createSwapchain(static_cast<uint32_t>(winW), static_cast<uint32_t>(winH));
 
+        lsfgperf::metrics.reset();
         g_presenter.running = true;
         g_presenter.constructed = true;
         g_presenter.thread = std::thread(presentLoop);
@@ -978,6 +988,11 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeSetTargetFps(JNIEnv*, jclass, jfloat fps)
     if (fps > 1.0f) g_presenter.targetFps = fps;
 }
 
+JNIEXPORT jstring JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativePerformanceStats(JNIEnv* env, jclass) {
+    return env->NewStringUTF(lsfgperf::metrics.summary().c_str());
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativeAhbPtr(JNIEnv* env, jclass, jobject obj) {
     if (!obj) return 0;
@@ -1001,7 +1016,7 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeQueueSize(JNIEnv*, jclass) {
  *  (instead of claiming success when the Vulkan path never produced a frame). */
 JNIEXPORT jlong JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativeFramesPresented(JNIEnv*, jclass) {
-    return (jlong)g_presenter.framesPresented;
+    return (jlong)g_presenter.framesPresented.load();
 }
 
 /**

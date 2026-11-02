@@ -265,6 +265,15 @@ class RootCaptureEngine(private val ctx: Context) {
             errorListener?.onError(message ?: "Unknown root capture error")
         }
 
+        override fun onCaptureMetrics(startedNs: Long, captureNs: Long, commandNs: Long,
+            readNs: Long, decodeNs: Long, copyNs: Long, backend: String?) {
+            PipelineStats.record("capture", captureNs)
+            if (commandNs >= 0) PipelineStats.record("screenshotCommand", commandNs)
+            if (readNs >= 0) PipelineStats.record("fileRead", readNs)
+            if (decodeNs >= 0) PipelineStats.record("decode", decodeNs)
+            if (copyNs >= 0) PipelineStats.record("pixelCopy", copyNs)
+        }
+
         override fun onFrameMetrics(timestampNs: Long, frameTimeNs: Long, pacingJitterNs: Long) {
             NativeBridge.reportShizukuTiming(timestampNs, frameTimeNs, pacingJitterNs)
             if (frameTimeNs > 0L && pacingJitterNs > frameTimeNs) {

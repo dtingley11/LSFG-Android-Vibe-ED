@@ -19,6 +19,8 @@ object FramegenBridge {
 
     /** "srcWritten,dispatches,framesAcquired" — real GPU operation counters. */
     private external fun nativeGetStats(): String
+    private external fun nativePerformanceStats(): String
+    fun performanceStats(): String = try { nativePerformanceStats() } catch (_: Throwable) { "unavailable" }
 
     init {
         try {
@@ -53,7 +55,7 @@ object FramegenBridge {
         return loaded
     }
 
-    private var instance = 0L
+    @Volatile private var instance = 0L
 
     @Synchronized
     fun createSession(
@@ -113,7 +115,6 @@ object FramegenBridge {
      * Used by the pipeline stats report to show real generated-frame rates.
      * Returns "0,0,0" when the native lib is not loaded.
      */
-    @Synchronized
     fun getStats(): Triple<Long, Long, Long> {
         if (instance == 0L) return Triple(0L, 0L, 0L)
         return try {

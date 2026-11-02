@@ -84,6 +84,7 @@ class CaptureEngine(
     @Volatile private var lastFrameMs = 0L
 
     private fun newSourceAhb(): HardwareBuffer {
+        PipelineStats.allocations.incrementAndGet()
         return HardwareBuffer.create(
             width, height, PixelFormat.RGBA_8888, 1,
             HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
@@ -120,7 +121,7 @@ class CaptureEngine(
                 while (running) {
                     val t0 = System.currentTimeMillis()
                     try {
-                        val ahb = captureOnce()
+                        val ahb = PipelineStats.measure("capture") { captureOnce() }
                         if (ahb != null) {
                             PipelineStats.incAcquired()
                             val ahbPtr = WsiBridge.nativeAhbPtr(ahb)
@@ -270,6 +271,7 @@ class CaptureEngine(
             val buf: ByteBuffer = plane.buffer
             val n = buf.remaining()
             if (n < width * height * 4) return null
+            val copyStart = System.nanoTime()
             val bytes = ByteArray(n)
             buf.duplicate().get(bytes)
             val ahb = newSourceAhb()
@@ -278,6 +280,7 @@ class CaptureEngine(
                 lastError = "nonroot: fillAhb failed"
                 return null
             }
+            PipelineStats.record("pixelCopy", System.nanoTime() - copyStart)
             lastFrameSource = "mediaprojection"
             return ahb
         } finally {

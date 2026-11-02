@@ -1,6 +1,8 @@
 package com.lsfg.fork.capture
 
 import java.util.concurrent.atomic.AtomicLong
+import com.lsfg.fork.performance.TimingWindow
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Process-wide pipeline telemetry. Every counter reflects an actual code
@@ -25,6 +27,26 @@ object PipelineStats {
     val generated = AtomicLong()
     val dropped = AtomicLong()
     val errors = AtomicLong()
+    val allocations = AtomicLong()
+    val sourceIntervals = TimingWindow()
+    val stages = ConcurrentHashMap<String, TimingWindow>()
+    private val lastSourceNs = AtomicLong()
+    val sessionId = AtomicLong()
+
+    fun record(stage: String, durationNs: Long) {
+        if (durationNs >= 0) stages.getOrPut(stage) { TimingWindow() }.record(durationNs / 1_000_000.0)
+    }
+
+    inline fun <T> measure(stage: String, block: () -> T): T {
+        val start = System.nanoTime()
+        try { return block() } finally { record(stage, System.nanoTime() - start) }
+    }
+
+    fun sourceFrame(timestampNs: Long = System.nanoTime()) {
+        acquired.incrementAndGet()
+        val last = lastSourceNs.getAndSet(timestampNs)
+        if (last > 0 && timestampNs > last) sourceIntervals.record((timestampNs - last) / 1_000_000.0)
+    }
 
     fun reset() {
         acquired.set(0)
@@ -32,9 +54,14 @@ object PipelineStats {
         generated.set(0)
         dropped.set(0)
         errors.set(0)
+        allocations.set(0)
+        sourceIntervals.clear()
+        stages.clear()
+        lastSourceNs.set(0)
+        sessionId.incrementAndGet()
     }
 
-    fun incAcquired() = acquired.incrementAndGet()
+    fun incAcquired() = sourceFrame()
     fun incSubmitted() = submitted.incrementAndGet()
     fun incGenerated(n: Long = 1) = generated.addAndGet(n)
     fun incDropped() = dropped.incrementAndGet()

@@ -4,6 +4,7 @@
 #include "lsfg_display.h"
 #include "vkhelper.hpp"
 #include "jnifile_log.h"
+#include "perf_metrics.h"
 
 #include <android/log.h>
 #include <android/hardware_buffer.h>
@@ -55,6 +56,7 @@ namespace {
         // output image into that imported destination image.
         std::unordered_map<uintptr_t, vk::UniqueCommandBuffer> dstBlits;
 
+        bool firstAcquire = true;
         std::mutex lock;
     };
 
@@ -66,10 +68,13 @@ namespace {
 
     void submitAndWait(JniState& st, vk::CommandBuffer cmdbuf) {
         auto& dld{*st.dld};
+        const auto submitStart = lsfgperf::nowNs();
         st.queue.submit({{
             .commandBufferCount = 1,
             .pCommandBuffers = &cmdbuf
         }}, *st.blitFence, dld);
+        lsfgperf::metrics.record(lsfgperf::Submit, lsfgperf::nowNs() - submitStart);
+        lsfgperf::Scope wait(lsfgperf::Wait);
         if (st.device.waitForFences(*st.blitFence, VK_TRUE, UINT64_MAX, dld) != vk::Result::eSuccess) {
             throw std::runtime_error("framegen blit wait failed");
         }
@@ -80,6 +85,7 @@ namespace {
     // completion, then release the one-shot import. Source AHBs are one-shot (captured,
     // blitted, then closed by the producer), so no import cache is kept (avoids leaks).
     void writeSourceLayer(JniState& st, const void* srcAhb, uint32_t layer) {
+        lsfgperf::Scope timing(lsfgperf::SourceUpload);
         auto& dld{*st.dld};
 
         auto srcImage = vkhelper::createImageFromAhb(dld, st.device, srcAhb);
@@ -286,6 +292,8 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeInit(JNIEnv* env, jclass, jstri
         env->ReleaseStringUTFChars(dllPath, dll);
 
         auto st = std::make_unique<JniState>();
+        g_fgSrcWritten = 0; g_fgDispatches = 0; g_fgFramesAcquired = 0;
+        lsfgperf::metrics.reset();
         st->instance = std::make_unique<lsfgvk::Instance>(
             "", std::filesystem::path(dllStr), allowFP16 == JNI_TRUE, false,
             [](const std::string& msg) { FLOG("%s", msg.c_str()); }
@@ -369,7 +377,9 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeDispatch(
     try {
         // Source uploads complete on this queue before dispatch; there is no
         // external fd-based producer to signal the context's sync semaphore.
+        lsfgperf::Scope timing(lsfgperf::Submit);
         st->context->dispatch(static_cast<uint32_t>(total), true);
+        st->firstAcquire = true;
         g_fgDispatches++;
     } catch (const std::exception& e) {
         FLOGE("nativeDispatch failed: %s", e.what());
@@ -397,6 +407,7 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeAcquireToDst(
     if (!st || !st->context) return;
     std::lock_guard<std::mutex> lock(st->lock);
     try {
+        lsfgperf::Scope outputTiming(lsfgperf::Output);
         const void* dst = reinterpret_cast<const void*>(dstAhbPtr);
 
         // Generate the next frame (into the pipeline's external output image).
@@ -408,6 +419,12 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeAcquireToDst(
         // recording the blit on first use for this buffer), synchronously.
         auto blit = ensureDstBlit(*st, dst);
         submitAndWait(*st, blit);
+        const auto timings = st->context->pipeline().gpuDurations(*st->dld, st->device);
+        if (st->firstAcquire && timings[0] >= 0)
+            lsfgperf::metrics.record(lsfgperf::PrepassGpu, static_cast<int64_t>(timings[0]));
+        if (timings[1] >= 0)
+            lsfgperf::metrics.record(lsfgperf::MainGpu, static_cast<int64_t>(timings[1]));
+        st->firstAcquire = false;
         g_fgFramesAcquired++;
     } catch (const std::exception& e) {
         FLOGE("nativeAcquireToDst failed: %s", e.what());
@@ -441,6 +458,11 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeDestroy(
     // RAII members release command buffers, imports, fence and pool before the
     // context and instance. Each Vulkan handle is destroyed exactly once.
     delete st;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_lsfg_fork_framegen_FramegenBridge_nativePerformanceStats(JNIEnv* env, jclass) {
+    return env->NewStringUTF(lsfgperf::metrics.summary().c_str());
 }
 
 /// Pipeline telemetry snapshot for the per-second Kotlin stats report.

@@ -666,10 +666,23 @@ Pipeline::Pipeline(
 
     LOG() << "  Transitioned all " << this->m_images.size() << " images into general layout";
 
+    const auto queueProperties = physdev.getQueueFamilyProperties(dld);
+    m_timestampBits = queueProperties.at(queueFamilyIndex).timestampValidBits;
+    m_timestampPeriod = physdev.getProperties(dld).limits.timestampPeriod;
+    if (m_timestampBits && m_timestampPeriod > 0 && signature.splitIndices.size() == 1) {
+        m_timestamps = device.createQueryPoolUnique({
+            .queryType = vk::QueryType::eTimestamp, .queryCount = 4
+        }, nullptr, dld);
+    }
     for (size_t i = 0; i < signature.splitIndices.size() + 1; i++) {
         auto& cmdbuf{this->m_cmdbufs.emplace_back()};
         cmdbuf = vkhelper::createCommandBuffer(dld, device, *this->m_pool);
         cmdbuf->begin({ .flags = vk::CommandBufferUsageFlagBits::eSimultaneousUse }, dld);
+
+        if (m_timestamps) {
+            cmdbuf->resetQueryPool(*m_timestamps, i * 2, 2, dld);
+            cmdbuf->writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *m_timestamps, i * 2, dld);
+        }
 
         cmdbuf->bindDescriptorSets(
             vk::PipelineBindPoint::eCompute,
@@ -825,12 +838,30 @@ Pipeline::Pipeline(
         }
     }
 
-    for (auto& cmdbuf : this->m_cmdbufs) {
+    for (size_t i = 0; i < m_cmdbufs.size(); ++i) {
+        auto& cmdbuf = m_cmdbufs[i];
+        if (m_timestamps)
+            cmdbuf->writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *m_timestamps, i * 2 + 1, dld);
         cmdbuf->end(dld);
     }
 
     LOG() << "  Recorded command buffers for pipeline execution";
     LOG() << "Finished building pipeline";
+}
+
+std::array<double, 2> Pipeline::gpuDurations(
+    const vk::detail::DispatchLoaderDynamic& dld, const vk::Device& device) const {
+    std::array<double, 2> out{-1, -1};
+    if (!m_timestamps) return out;
+    uint64_t ticks[4]{};
+    const auto result = dld.vkGetQueryPoolResults(static_cast<VkDevice>(device),
+        static_cast<VkQueryPool>(*m_timestamps), 0, 4, sizeof(ticks), ticks,
+        sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (result != VK_SUCCESS) return out;
+    const auto mask = m_timestampBits >= 64 ? UINT64_MAX : ((uint64_t{1} << m_timestampBits) - 1);
+    for (size_t i = 0; i < 2; ++i)
+        out[i] = ((ticks[i * 2 + 1] - ticks[i * 2]) & mask) * m_timestampPeriod;
+    return out;
 }
 
 vk::CommandBuffer Pipeline::buildTransCmdbuf(

@@ -119,6 +119,10 @@ namespace lsfgvk {
             uint32_t total
         );
 
+        /// Completed GPU timestamp spans in nanoseconds, or -1 when unavailable.
+        std::array<double, 2> gpuDurations(
+            const vk::detail::DispatchLoaderDynamic& dld, const vk::Device& device) const;
+
     private:
         /// Vulkan descriptor set & pipeline layout
         struct Layout {
@@ -202,6 +206,9 @@ namespace lsfgvk {
         };
         std::vector<Stage> m_stages;
 
+        vk::UniqueQueryPool m_timestamps;
+        double m_timestampPeriod = 0;
+        uint32_t m_timestampBits = 0;
         vk::UniqueCommandPool m_pool;
         std::vector<vk::UniqueCommandBuffer> m_cmdbufs;
         std::unordered_map<uint64_t, vk::UniqueCommandBuffer> m_transCmdbufs;

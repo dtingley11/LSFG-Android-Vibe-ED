@@ -22,6 +22,10 @@ class RootCaptureService : RootService() {
 
         private val running = AtomicBoolean(false)
         private var worker: Thread? = null
+        private var commandNs = -1L
+        private var readNs = -1L
+        private var decodeNs = -1L
+        private var copyNs = -1L
 
         override fun startCapture(
             targetUid: Int,
@@ -76,6 +80,8 @@ class RootCaptureService : RootService() {
             var nullStreak = 0
             while (running.get()) {
                 val started = SystemClock.uptimeMillis()
+                val captureStartedNs = System.nanoTime()
+                commandNs = -1; readNs = -1; decodeNs = -1; copyNs = -1
                 // Try the GPU-side capture first; if it yields nothing (some
                 // vendors return null / throw), fall back to screencap so the
                 // session still gets frames.
@@ -111,6 +117,8 @@ class RootCaptureService : RootService() {
                     val pacingJitterNs = if (frameTimeNs > 0L) kotlin.math.abs(frameTimeNs - targetPeriodNs) else 0L
                     lastFrameNs = timestampNs
                     try {
+                        callback.onCaptureMetrics(captureStartedNs, timestampNs - captureStartedNs,
+                            commandNs, readNs, decodeNs, copyNs, source)
                         callback.onFrameMetrics(timestampNs, frameTimeNs, pacingJitterNs)
                         callback.onFrame(hb, timestampNs)
                     } catch (t: Throwable) {
@@ -141,13 +149,21 @@ class RootCaptureService : RootService() {
          */
         private fun captureScreencap(width: Int, height: Int): HardwareBuffer? {
             val path = "/data/local/tmp/lsfg_root_cap.png"
+            val commandStart = System.nanoTime()
             val res = runCatching {
                 com.topjohnwu.superuser.Shell.cmd("screencap -p $path").exec()
             }.getOrElse { return null }
+            commandNs = System.nanoTime() - commandStart
             if (!res.isSuccess) return null
-            val src = BitmapFactory.decodeFile(path)
+            val readStart = System.nanoTime()
+            val png = runCatching { File(path).readBytes() }.getOrNull() ?: return null
+            readNs = System.nanoTime() - readStart
+            val decodeStart = System.nanoTime()
+            val src = BitmapFactory.decodeByteArray(png, 0, png.size)
+            decodeNs = System.nanoTime() - decodeStart
             runCatching { File(path).delete() }
             if (src == null) return null
+            val copyStart = System.nanoTime()
             return try {
                 val ahb = HardwareBuffer.create(
                     width, height, PixelFormat.RGBA_8888, 1,
@@ -176,7 +192,7 @@ class RootCaptureService : RootService() {
             } catch (t: Throwable) {
                 Log.w(TAG, "screencap fallback failed", t)
                 null
-            }
+            } finally { copyNs = System.nanoTime() - copyStart }
         }
     }
 
