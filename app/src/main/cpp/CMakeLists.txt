@@ -12,6 +12,7 @@ add_library(
     framegen/lsfgvk.cpp
     framegen/vkhelper.cpp
     framegen/lsfg_jni.cpp
+    framegen/ahb_output_ring.cpp
 )
 
 target_include_directories(lsfg_framegen PRIVATE

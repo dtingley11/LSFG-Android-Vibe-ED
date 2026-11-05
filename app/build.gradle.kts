@@ -64,8 +64,19 @@ val runDllParserTest = tasks.register<Exec>("runDllParserTest") {
             "&& $exe ../../main/assets/lsfg-vk.dll"
     )
 }
+val runDisplayQueueTest = tasks.register<Exec>("runDisplayQueueTest") {
+    workingDir = file("src/test/cpp")
+    commandLine("/bin/sh", "-c", "mkdir -p build && g++ -std=c++20 -pthread -O0 -o build/display_queue_test " +
+        "display_queue_test.cpp ../../main/cpp/lsfg_display.cpp -I stubs -I ../../main/cpp && build/display_queue_test && g++ -std=c++20 -O0 -o build/rgba_copy_test rgba_copy_test.cpp -I ../../main/cpp && build/rgba_copy_test")
+}
+val runOutputRingTest = tasks.register<Exec>("runOutputRingTest") {
+    workingDir = file("src/test/cpp")
+    commandLine("/bin/sh", "-c", "mkdir -p build && g++ -std=c++20 -O0 -DVK_USE_PLATFORM_ANDROID_KHR " +
+        "-I stubs -I ../../main/cpp -I ../../main/cpp/framegen/thirdparty " +
+        "ahb_output_ring_test.cpp ../../main/cpp/framegen/ahb_output_ring.cpp -o build/ahb_output_ring_test && build/ahb_output_ring_test")
+}
 tasks.matching { it.name == "testDebugUnitTest" || it.name == "testReleaseUnitTest" }
-    .configureEach { dependsOn(runDllParserTest) }
+    .configureEach { dependsOn(runDllParserTest, runDisplayQueueTest, runOutputRingTest) }
 
 kotlin {
     jvmToolchain(17)

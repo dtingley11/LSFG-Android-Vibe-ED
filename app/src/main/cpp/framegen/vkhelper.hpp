@@ -325,7 +325,7 @@ namespace vkhelper {
         uint32_t srcLayer,
         const vk::Image& dstImage,
         uint32_t dstLayer,
-        vk::Extent2D extent
+        vk::Extent2D extent, vk::Extent2D dstExtent = {}
     );
 
     /* Synchronization */

@@ -3,6 +3,7 @@ package com.lsfg.fork.ui
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import com.lsfg.fork.performance.OperatingMode
 import com.lsfg.fork.SessionManager
 import com.lsfg.fork.ShellBridge
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -46,6 +47,7 @@ fun HomeScreen(
     var apps by remember { mutableStateOf<List<ShellBridge.AppInfo>>(emptyList()) }
     var showPicker by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
+        session.loadSettings(ctx)
         apps = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             ShellBridge.launchableApps(ctx)
         }
@@ -135,12 +137,38 @@ fun HomeScreen(
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("Frame interpolation", style = MaterialTheme.typography.titleMedium)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        OperatingMode.entries.forEach { mode ->
+                            FilterChip(selected = s.operatingMode == mode, onClick = { session.setOperatingMode(mode) }, label = { Text(mode.label) })
+                        }
+                    }
+                    Text("Output limit")
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(60, 75, 80, 90, 120).forEach { fps ->
+                            FilterChip(selected = s.targetFps.toInt() == fps, onClick = { session.setTargetFps(fps.toFloat()) }, label = { Text("$fps") })
+                        }
+                    }
+                    var customFps by remember { mutableStateOf("") }
+                    OutlinedTextField(value = customFps, onValueChange = { value ->
+                        customFps = value.filter(Char::isDigit).take(3)
+                        customFps.toIntOrNull()?.takeIf { it in 15..240 }?.let { session.setTargetFps(it.toFloat()) }
+                    }, label = { Text("Custom FPS (15–240)") }, singleLine = true)
+                    Text("Total GPU ceiling: ${s.gpuCeiling.toInt()}%")
+                    Slider(value = s.gpuCeiling, onValueChange = session::setGpuCeiling, valueRange = 30f..95f, steps = 12)
+                    Text("Processing resolution: ${(s.processingScale * 100).toInt()}%")
+                    Slider(value = s.processingScale, onValueChange = session::setProcessingScale,
+                        valueRange = .25f..1f, steps = 2, enabled = !running)
+                    if (running) {
+                        Text("Target ${s.effectiveTarget.toInt()} FPS · ${s.effectiveMultiplier}× · GPU ${s.gpuPercent?.let { "%.0f%%".format(it) } ?: "unavailable"}", style = MaterialTheme.typography.bodySmall)
+                        Text(s.adaptiveReason, style = MaterialTheme.typography.bodySmall)
+                    }
+
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Multiplier")
+                        Text("Fixed multiplier")
                         Row(
                             Modifier.horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(6.dp)

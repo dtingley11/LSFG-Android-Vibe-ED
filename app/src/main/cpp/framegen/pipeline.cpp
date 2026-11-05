@@ -670,9 +670,11 @@ Pipeline::Pipeline(
     m_timestampBits = queueProperties.at(queueFamilyIndex).timestampValidBits;
     m_timestampPeriod = physdev.getProperties(dld).limits.timestampPeriod;
     if (m_timestampBits && m_timestampPeriod > 0 && signature.splitIndices.size() == 1) {
-        m_timestamps = device.createQueryPoolUnique({
-            .queryType = vk::QueryType::eTimestamp, .queryCount = 4
-        }, nullptr, dld);
+        try {
+            m_timestamps = device.createQueryPoolUnique({
+                .queryType = vk::QueryType::eTimestamp, .queryCount = 4
+            }, nullptr, dld);
+        } catch (const std::exception&) { m_timestampBits = 0; }
     }
     for (size_t i = 0; i < signature.splitIndices.size() + 1; i++) {
         auto& cmdbuf{this->m_cmdbufs.emplace_back()};

@@ -8,6 +8,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.lsfg.fork.performance.*
 import com.lsfg.fork.capture.CaptureEngine
 import com.lsfg.fork.capture.PipelineStats
 import com.lsfg.fork.capture.RootCaptureEngineAdapter
@@ -77,7 +78,15 @@ class SessionManager : ViewModel() {
         val framegenReady: Boolean = false,
         val framegenSource: String = "bundled",
         val statusMsg: String = "idle",
-        val targetFps: Float = 60f,
+        val targetFps: Float = 90f,
+        val operatingMode: OperatingMode = OperatingMode.ADAPTIVE,
+        val gpuCeiling: Float = 85f,
+        val processingScale: Float = .5f,
+        val effectiveMultiplier: Int = 1,
+        val effectiveTarget: Float = 30f,
+        val adaptiveReason: String = "Measuring capture and processing",
+        val gpuPercent: Double? = null,
+        val thermalStatus: Int? = null,
         val displayW: Int = 0,
         val displayH: Int = 0,
         val queueDepth: Int = 0,
@@ -103,10 +112,27 @@ class SessionManager : ViewModel() {
     // Real frame-generation session (LSFG pipeline). false => passthrough.
     @Volatile private var framegenSessionOk: Boolean = false
     @Volatile private var capturedFrameIdx: Int = 0
+    private var exportedOutputPool = false
     private val dstPool = java.util.ArrayList<HardwareBuffer>()
     @Volatile private var dstPoolIdx: Int = 0
     @Volatile private var displayW: Int = 0
     @Volatile private var displayH: Int = 0
+
+    private data class SourceFrame(val buffer: HardwareBuffer, val timestampNs: Long, val requestNs: Long, val release: () -> Unit) : AutoCloseable {
+        override fun close() = release()
+    }
+    @Volatile private var acceptingFrames = false
+    @Volatile private var terminalFailure = false
+    @Volatile private var effectiveDecision = SmoothnessDecision(1, 30.0, "Measuring capture and processing")
+    private var sourceQueue: LatestFrameQueue<SourceFrame>? = null
+    private var processingThread: Thread? = null
+    private val controller = AdaptiveController()
+    private val cadence = OutputCadence()
+    private var previousSourceNs = 0L
+    private var processingEstimateNs = 0L
+    private var historyReady = false
+    private var failedSourceFrame: SourceFrame? = null
+    private var settingsStore: android.content.SharedPreferences? = null
 
     init {
         val r = RootChecker.detect()
@@ -123,7 +149,25 @@ class SessionManager : ViewModel() {
     fun setPerformance(v: Boolean) = _state.update { it.copy(performance = v) }
     fun setFramegenBypass(v: Boolean) = _state.update { it.copy(framegenBypass = v) }
     fun setCaptureMode(mode: String) = _state.update { it.copy(captureMode = mode) }
-    fun setTargetFps(v: Float) = _state.update { it.copy(targetFps = v) }
+    fun setTargetFps(v: Float) { _state.update { it.copy(targetFps = v.coerceIn(15f, 240f)) }; saveSettings() }
+    fun setOperatingMode(v: OperatingMode) { _state.update { it.copy(operatingMode = v) }; saveSettings() }
+    fun setGpuCeiling(v: Float) { _state.update { it.copy(gpuCeiling = v.coerceIn(30f, 95f)) }; saveSettings() }
+    fun setProcessingScale(v: Float) { if (!isRunning()) { _state.update { it.copy(processingScale = v.coerceIn(.25f, 1f)) }; saveSettings() } }
+    fun loadSettings(context: Context) {
+        if (settingsStore != null) return
+        val prefs = context.getSharedPreferences("smoothness", Context.MODE_PRIVATE)
+        settingsStore = prefs
+        _state.update { it.copy(
+            operatingMode = runCatching { OperatingMode.valueOf(prefs.getString("mode", "ADAPTIVE")!!) }.getOrDefault(OperatingMode.ADAPTIVE),
+            targetFps = prefs.getFloat("limit", 90f).coerceIn(15f, 240f),
+            gpuCeiling = prefs.getFloat("gpu", 85f).coerceIn(30f, 95f),
+            processingScale = prefs.getFloat("scale", .5f).coerceIn(.25f, 1f)) }
+    }
+    private fun saveSettings() {
+        val s = _state.value
+        settingsStore?.edit()?.putString("mode", s.operatingMode.name)?.putFloat("limit", s.targetFps)
+            ?.putFloat("gpu", s.gpuCeiling)?.putFloat("scale", s.processingScale)?.apply()
+    }
     fun setTestPattern(v: Boolean) = _state.update { it.copy(testPattern = v) }
 
     fun refreshRoot() {
@@ -166,6 +210,8 @@ class SessionManager : ViewModel() {
         appContext: Context,
         userDllPath: String? = null
     ) {
+        if (terminalFailure) { _state.update { it.copy(statusMsg = "Restart the app after the GPU failure") }; return }
+        loadSettings(appContext)
         if (_state.value.running) {
             Log.w(TAG, "beginSession: already running, ignored")
             return
@@ -227,7 +273,7 @@ class SessionManager : ViewModel() {
         capturedFrameIdx = 0
         dstPoolIdx = 0
         dstPool.clear()
-        if (!s.framegenBypass) {
+        run {
             val dllPath = userDllPath?.takeIf { it.isNotBlank() } ?: extractShaderDll(appContext)
             val srcLabel = if (userDllPath != null && userDllPath.isNotBlank()) "user" else "bundled"
             Log.i(TAG, "beginSession: setting up framegen from $dllPath ($srcLabel)")
@@ -242,49 +288,72 @@ class SessionManager : ViewModel() {
                 )
             }
             Log.i(TAG, "beginSession: framegen ${if (ok) "READY" else "NOT ready -> passthrough"}")
-        } else {
-            _state.update { it.copy(framegenReady = false) }
         }
 
         // 3. Destination AHB pool for generated frames (presenter reads these).
         val poolSize = 8
-        repeat(poolSize) {
-            dstPool.add(
-                HardwareBuffer.create(
-                    w, h, PixelFormat.RGBA_8888, 1,
-                    // Destination AHBs for generated frames.  Cross-device
-                    // sharing (framegen writes, WSI reads) is handled at the
-                    // Vulkan memory-type level (vkGetAndroidHardwareBufferProperties
-                    // intersection), so the AHB usage flag stays GPU_SAMPLED_IMAGE.
-                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
-                )
-            )
+        exportedOutputPool = false
+        try {
+            val exported = if (framegenSessionOk) FramegenBridge.createOutputBuffers(w, h, poolSize) else null
+            if (exported != null) {
+                dstPool.addAll(exported)
+                exportedOutputPool = true
+                Log.i(TAG, "Output buffers: Vulkan-owned AHB export ring (${exported.size}, ${w}x${h})")
+            } else {
+                repeat(poolSize) {
+                    dstPool.add(HardwareBuffer.create(w, h, PixelFormat.RGBA_8888, 1, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE))
+                }
+                Log.i(TAG, "Output buffers: imported app allocations ($poolSize, ${w}x${h})")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Output buffer setup failed: ${t.message}")
+            endSession()
+            _state.update { it.copy(statusMsg = "Output buffer setup failed: ${t.message}") }
+            return
         }
 
         // 4. Frame source: built-in test pattern OR capture engine.
         // Privileged (root/shizuku) engines feed frames through NativeBridge;
         // wire the session sink (framegen drive or passthrough) before start.
         PipelineStats.reset()
-        NativeBridge.sessionFrameSink = { hb ->
-            val ptr = WsiBridge.nativeAhbPtr(hb)
-            if (framegenSessionOk && ptr != 0L) driveFramegen(hb, ptr, _state.value.multiplier)
-            else if (ptr != 0L) {
-                WsiBridge.nativePushFrame(ptr)
-                PipelineStats.incSubmitted()
-            } else {
-                PipelineStats.incDropped()
-                0
+        controller.reset(); cadence.reset(); historyReady = false; previousSourceNs = 0L; processingEstimateNs = 0L
+        acceptingFrames = true
+        com.lsfg.fork.overlay.OverlayHost.setOutputVisible(s.testPattern || s.framegenBypass || s.operatingMode == OperatingMode.FIXED)
+        effectiveDecision = SmoothnessDecision(1, 30.0, "Measuring capture and processing")
+        sourceQueue = LatestFrameQueue(80_000_000L) { PipelineStats.incDropped() }
+        val queue = sourceQueue!!
+        processingThread = thread(name = "lsfg-processing", isDaemon = true) {
+            while (acceptingFrames) {
+                val frame = queue.poll(System.nanoTime())
+                if (frame == null) { try { Thread.sleep(1) } catch (_: InterruptedException) { break }; continue }
+                try {
+                    driveFramegen(frame.buffer, WsiBridge.nativeAhbPtr(frame.buffer), effectiveDecision.multiplier, frame.timestampNs, frame.requestNs)
+                } catch (t: Throwable) {
+                    terminalFailure = true; acceptingFrames = false; queue.close()
+                    PipelineStats.incErrors()
+                    _state.update { it.copy(statusMsg = t.message ?: "Processing failed; restart the app") }
+                    Log.e(TAG, "Processing stopped: ${t.message}")
+                } finally {
+                    PipelineStats.record("captureRequestToProcessed", System.nanoTime() - frame.requestNs)
+                    if (terminalFailure) failedSourceFrame = frame else frame.close()
+                }
             }
         }
+        NativeBridge.sessionFrameSink = { hb, timestamp ->
+            val retained = WsiBridge.nativeRetainBuffer(hb)
+            enqueueSource(retained, timestamp) { retained.close() }
+        }
+
         val onStats = { fps: Float, lat: Float, err: String? ->
             // Honest health check: the session is only "OK" if the presenter
             // has actually presented at least one frame (Vulkan path live).
             val presented = try { WsiBridge.framesPresented() } catch (_: Throwable) { 0L }
             val healthy = presented > 0L && err == null
             val status = if (err != null) err
+                else if (effectiveDecision.multiplier == 1 && !s.testPattern && !s.framegenBypass && s.operatingMode != OperatingMode.FIXED) "monitoring; native game visible"
                 else if (presented == 0L) "running BUT presenter produced 0 frames (check logcat lsfg-wsi)"
                 else "running: ${s.captureMode} -> LSFG -> overlay"
-            _state.update {
+            if (!terminalFailure) _state.update {
                 it.copy(
                     fps = fps,
                     captureLatencyMs = lat,
@@ -295,9 +364,6 @@ class SessionManager : ViewModel() {
                 )
             }
         }
-        val frameSink: (HardwareBuffer, Long) -> Int = { srcAhb, srcAhbPtr ->
-            driveFramegen(srcAhb, srcAhbPtr, _state.value.multiplier)
-        }
 
         var usedPrivileged = false
         if (s.testPattern) {
@@ -307,23 +373,18 @@ class SessionManager : ViewModel() {
             testThread = thread(name = "lsfg-testpattern", isDaemon = true) {
                 val intervalNs = 1_000_000_000L / 30
                 var ok = 0
-                while (_state.value.running) {
+                while (_state.value.running && acceptingFrames) {
                     // keep producing while the session is live
                     if (!_state.value.running) break
                     val t0 = System.nanoTime()
                     try {
-                        val ahb = pattern.next()
+                        PipelineStats.captureStartedNs.set(System.nanoTime())
+                        val ahb = PipelineStats.measure("syntheticRender") { pattern.next() }
                         if (ahb != null) {
                             PipelineStats.incAcquired()
-                            val ptr = WsiBridge.nativeAhbPtr(ahb)
-                            if (framegenSessionOk) {
-                                val produced = driveFramegen(ahb, ptr, _state.value.multiplier)
-                                if (produced > 0) ok++
-                            } else if (ptr != 0L) {
-                                WsiBridge.nativePushFrame(ptr)
-                                PipelineStats.incSubmitted()
-                                ok++
-                            } else PipelineStats.incDropped()
+                            val retained = WsiBridge.nativeRetainBuffer(ahb)
+                            enqueueSource(retained, System.nanoTime()) { WsiBridge.nativeCancel(WsiBridge.nativeAhbPtr(retained)); retained.close() }
+                            ok++
                         }
                     } catch (t: Throwable) {
                         Log.w(TAG, "testpattern frame failed: ${t.message}")
@@ -341,7 +402,7 @@ class SessionManager : ViewModel() {
                         // Thread.sleep(millis, nanos) requires nanos < 1,000,000.
                         val millis = sleep / 1_000_000L
                         val nanos = (sleep % 1_000_000L).toInt()
-                        Thread.sleep(millis, nanos)
+                        try { Thread.sleep(millis, nanos) } catch (_: InterruptedException) { break }
                     }
                 }
                 Log.i(TAG, "testpattern stopped after $ok frames")
@@ -390,12 +451,12 @@ class SessionManager : ViewModel() {
                 appContext = appContext,
                 width = w,
                 height = h,
-                minIntervalMs = (1000f / 30f).toLong(),
+                minIntervalMs = 1L,
                 onStats = onStats,
                 projection = proj
             )
             eng.mode = mode
-            eng.frameSink = frameSink
+            eng.ownedFrameSink = { buffer, timestamp, release -> enqueueSource(buffer, timestamp, release) }
             // CRITICAL (Jan: "capture by any means possible"): if this is a
             // non-root session but the device actually has a working root, arm
             // the root `screencap` fallback. Then if MediaProjection ever yields
@@ -416,7 +477,7 @@ class SessionManager : ViewModel() {
 
         // Per-second pipeline telemetry for modes without an adapter stats
         // loop (test pattern, nonroot/MediaProjection, root screencap fallback).
-        startSessionStatsReporter(s.testPattern || !usedPrivileged)
+        startSessionStatsReporter(appContext)
 
         if (framegenSessionOk) {
             _state.update { it.copy(statusMsg = "running: ${s.captureMode} -> LSFG v3.1 -> overlay") }
@@ -441,9 +502,10 @@ class SessionManager : ViewModel() {
             val presented = try { WsiBridge.framesPresented() } catch (_: Throwable) { 0L }
             val healthy = presented > 0L && err == null
             val status = if (err != null) err
+                else if (effectiveDecision.multiplier == 1 && !s.testPattern && !s.framegenBypass && s.operatingMode != OperatingMode.FIXED) "monitoring; native game visible"
                 else if (presented == 0L) "running BUT presenter produced 0 frames (check logcat lsfg-wsi)"
                 else "running: ${s.captureMode} -> LSFG -> overlay"
-            _state.update {
+            if (!terminalFailure) _state.update {
                 it.copy(
                     fps = fps,
                     captureLatencyMs = lat,
@@ -531,46 +593,128 @@ class SessionManager : ViewModel() {
     /**
      * Drive the LSFG pipeline for one captured source frame.
      */
-    private fun driveFramegen(srcAhb: HardwareBuffer, srcAhbPtr: Long, multiplier: Int): Int {
-        if (!framegenSessionOk) return 0
-        // The framegen pipeline's external input is a 2-layer image (prev/cur).
-        // The slot must stay in [0,1]; the unbounded counter would eventually
-        // write to a non-existent layer (native OOB -> the ~5s crash).
-        val slot = (capturedFrameIdx % 2)
-        val m = if (multiplier < 1) 1 else multiplier
+    private fun enqueueSource(buffer: HardwareBuffer, timestamp: Long, release: () -> Unit) {
+        if (!acceptingFrames) { release(); return }
+        sourceQueue?.offer(SourceFrame(buffer, timestamp, PipelineStats.captureStartedNs.get().takeIf { it > 0 }?.coerceAtMost(timestamp) ?: timestamp, release), timestamp) ?: release()
+    }
 
-        val processingStart = System.nanoTime()
-        FramegenBridge.writeSource(srcAhbPtr, slot)
-        FramegenBridge.dispatch(m)
-
-        var produced = 0
-        repeat(m) {
-            val dst = dstPool[dstPoolIdx % dstPool.size]
-            val dstPtr = WsiBridge.nativeAhbPtr(dst)
-            if (dstPtr == 0L) return@repeat
-            FramegenBridge.acquireToDst(dstPtr)
-            WsiBridge.nativePushFrame(dstPtr)
-            PipelineStats.incGenerated()
-            dstPoolIdx++
-            produced++
+    private fun driveFramegen(srcAhb: HardwareBuffer, srcAhbPtr: Long, multiplier: Int, sourceNs: Long = System.nanoTime(), requestNs: Long = sourceNs): Int {
+        if (srcAhbPtr == 0L) return 0
+        val started = System.nanoTime()
+        val mode = _state.value.operatingMode
+        val m = if (_state.value.framegenBypass) 1 else multiplier.coerceIn(1, 4)
+        val monitorOnly = m == 1 && !_state.value.testPattern && !_state.value.framegenBypass && mode != OperatingMode.FIXED
+        if (monitorOnly) {
+            historyReady = false; previousSourceNs = sourceNs
+            PipelineStats.record("processing", System.nanoTime() - started)
+            return 0
         }
-        capturedFrameIdx++
-        PipelineStats.record("processing", System.nanoTime() - processingStart)
+        if (!framegenSessionOk) {
+            // The fallback presenter owns the buffer until its GPU read completes.
+            // A MediaProjection Image lease must outlive that read as well.
+            if (!WsiBridge.nativeReserve(srcAhbPtr)) return 0
+            WsiBridge.nativePushTimed(srcAhbPtr, sourceNs, sourceNs, 0)
+            PipelineStats.incSubmitted()
+            val timeout = System.nanoTime() + 500_000_000L
+            while (!WsiBridge.nativeReserve(srcAhbPtr)) {
+                check(System.nanoTime() < timeout) { "Presenter did not release the source buffer" }
+                Thread.sleep(1)
+            }
+            WsiBridge.nativeCancel(srcAhbPtr)
+            return 1
+        }
+        val interval = if (previousSourceNs > 0) (sourceNs - previousSourceNs).coerceIn(4_000_000L, 100_000_000L) else 33_333_333L
+        val previous = previousSourceNs.takeIf { it > 0 } ?: sourceNs
+        val slot = capturedFrameIdx % 2
+        val interpolate = m > 1 && historyReady
+        if (m > 1) {
+            if (!historyReady) {
+                FramegenBridge.writeSource(srcAhbPtr, 0); FramegenBridge.writeSource(srcAhbPtr, 1)
+                historyReady = true
+            } else FramegenBridge.writeSource(srcAhbPtr, slot)
+        } else historyReady = false
+        if (interpolate) FramegenBridge.dispatch(m - 1)
+        val phases = InterpolationPlan.phases(if (interpolate) m else 1)
+        val count = phases.size
+        val base = maxOf(System.nanoTime(), sourceNs + processingEstimateNs)
+        var produced = 0
+        repeat(count) { index ->
+            val contentNs = if (interpolate) previous + (interval * phases[index]).toLong() else sourceNs
+            val selected = cadence.select(contentNs, effectiveDecision.targetFps)
+            val dst = dstPool.firstOrNull { WsiBridge.nativeReserve(WsiBridge.nativeAhbPtr(it)) }
+            if (dst == null) {
+                // Drain an unselected interpolation phase without writing into an occupied buffer.
+                if (interpolate && index < m - 1) FramegenBridge.acquire()
+                PipelineStats.incDropped(); return@repeat
+            }
+            val ptr = WsiBridge.nativeAhbPtr(dst)
+            var transferred = false
+            try {
+                if (interpolate && index < m - 1) {
+                    FramegenBridge.acquireToDst(ptr); PipelineStats.incGenerated()
+                } else FramegenBridge.copySource(srcAhbPtr, ptr)
+                if (selected) {
+                    val due = if (interpolate) base + interval * index / m else 0L
+                    WsiBridge.nativePushTimed(ptr, sourceNs, contentNs, due, exportedOutputPool)
+                    transferred = true; PipelineStats.incSubmitted(); produced++
+                } else PipelineStats.incDropped()
+            } finally { if (!transferred) WsiBridge.nativeCancel(ptr) }
+        }
+        if (interpolate) capturedFrameIdx++
+        previousSourceNs = sourceNs
+        val cost = System.nanoTime() - started
+        processingEstimateNs = maxOf(cost, (processingEstimateNs * .9 + cost * .1).toLong())
+        PipelineStats.record("processing", cost)
+        PipelineStats.record("sourceToOutput", System.nanoTime() - sourceNs)
+        PipelineStats.record("captureRequestToOutput", System.nanoTime() - requestNs)
         return produced
     }
 
-    /**
-     * Per-second pipeline telemetry for session modes that don't run an
-     * adapter stats loop (test pattern, nonroot/MediaProjection). The
-     * root/shizuku adapters log their own pipeline line, so this is skipped
-     * for privileged capture.
-     */
-    private fun startSessionStatsReporter(active: Boolean) {
+    private fun startSessionStatsReporter(context: Context) {
         stopSessionStatsReporter()
-        if (!active) return
+        val monitor = DevicePerformanceMonitor(context)
+        val scheduledRate = RateMeter().apply { reset() }
+        val missedRate = RateMeter().apply { reset() }
+        val sourceRate = RateMeter().apply { reset() }
+        val presentRate = RateMeter().apply { reset() }
+        val display = context.getSystemService(android.hardware.display.DisplayManager::class.java).getDisplay(android.view.Display.DEFAULT_DISPLAY)
         sessionStatsThread = thread(name = "lsfg-session-stats", isDaemon = true) {
+            var lastNs = System.nanoTime()
             while (_state.value.running) {
                 try { Thread.sleep(1000L) } catch (_: InterruptedException) { break }
+                if (!WsiBridge.isRunning()) {
+                    terminalFailure = true; acceptingFrames = false; sourceQueue?.close()
+                    _state.update { it.copy(statusMsg = "Presenter stopped; restart the app") }
+                    break
+                }
+                val now = System.nanoTime(); val dt = (now - lastNs) / 1e9; lastNs = now
+                val source = sourceRate.sample(PipelineStats.acquired.get(), dt)
+                val presented = presentRate.sample(WsiBridge.framesPresented(), dt)
+                val intervals = PipelineStats.sourceIntervals.summary()
+                val processing = PipelineStats.stages["processing"]?.summary()?.p95 ?: 0.0
+                val wsiTimings = NativeTimingSnapshot(WsiBridge.performanceStats())
+                val counters = WsiBridge.nativePresentationCounters()
+                val scheduled = scheduledRate.sample(counters[0], dt)
+                val missed = missedRate.sample(counters[1], dt)
+                val latency = maxOf(PipelineStats.stages["captureRequestToProcessed"]?.summary()?.p95 ?: 0.0,
+                    if (effectiveDecision.multiplier > 1) wsiTimings.p95("captureToPresentRequest") ?: 0.0 else 0.0)
+                val signals = monitor.sample(now / 1_000_000)
+                val s = _state.value
+                val decision = controller.update(PerformanceSample(now / 1_000_000, source, intervals.p50, intervals.p95,
+                    processing, latency, presented,
+                    if (scheduled > 0) missed / scheduled else 0.0,
+                    WsiBridge.queueSize() + (sourceQueue?.size() ?: 0), if (WsiBridge.queueSize() > 0) wsiTimings.p95("queueAge") ?: 0.0 else 0.0,
+                    display?.refreshRate?.toDouble() ?: 60.0, signals.gpuPercent, signals.thermalStatus, signals.thermalLoad),
+                    SmoothnessSettings(s.operatingMode, s.targetFps.toDouble(), s.gpuCeiling.toDouble(), s.multiplier))
+                effectiveDecision = decision
+                val showOutput = s.testPattern || s.framegenBypass || s.operatingMode == OperatingMode.FIXED || decision.multiplier > 1
+                WsiBridge.setPaused(!showOutput)
+                com.lsfg.fork.overlay.OverlayHost.setOutputVisible(showOutput)
+                WsiBridge.setTargetFps(decision.targetFps.toFloat())
+                _state.update { it.copy(effectiveMultiplier = decision.multiplier, effectiveTarget = decision.targetFps.toFloat(),
+                    adaptiveReason = decision.reason, gpuPercent = signals.gpuPercent, thermalStatus = signals.thermalStatus,
+                    fps = presented.toFloat(), framesPresented = WsiBridge.framesPresented()) }
+                Log.i(TAG, "adaptive mode=${s.operatingMode} multiplier=${decision.multiplier} target=${decision.targetFps} gpu=${signals.gpuPercent ?: "unavailable"} provider=${signals.gpuSource} thermal=${signals.thermalStatus} reason=${decision.reason}")
                 reportPipelineStats("lsfg-session")
             }
         }
@@ -611,8 +755,8 @@ class SessionManager : ViewModel() {
             // operates on the aligned extent). 2186 -> 2176 = 2^4 * 136,
             // every mipmap level stays even.
             val align = 16
-            val fw = (w / align) * align
-            val fh = (h / align) * align
+            val fw = ((w * s.processingScale).toInt() / align) * align
+            val fh = ((h * s.processingScale).toInt() / align) * align
             val okSession = if (fw >= align && fh >= align) {
                 FramegenBridge.createSession(fw, fh, s.flowScale, s.performance)
             } else {
@@ -655,21 +799,34 @@ class SessionManager : ViewModel() {
         return target.absolutePath
     }
 
+    @Synchronized
     fun endSession() {
         if (!_state.value.running) return
         Log.i(TAG, "endSession")
+        acceptingFrames = false
+        _state.update { it.copy(running = false) }
         stopSessionStatsReporter()
         try { testThread?.interrupt() } catch (_: Throwable) {}
+        try { testThread?.join(2000) } catch (_: InterruptedException) {}
+        if (testThread?.isAlive == true) { terminalFailure = true; return }
         testThread = null
         try { testPattern?.stop() } catch (_: Throwable) {}
         testPattern = null
-        try { engine?.release() } catch (t: Throwable) { Log.w(TAG, "engine release: ${t.message}") }
-        engine = null
+        try { engine?.stop() } catch (t: Throwable) { terminalFailure = true; Log.w(TAG, "engine release: ${t.message}") }
         try { privilegedCapture?.release() } catch (_: Throwable) {}
         privilegedCapture = null
         try { shizukuCapture?.release() } catch (_: Throwable) {}
         shizukuCapture = null
         NativeBridge.sessionFrameSink = null
+        sourceQueue?.close()
+        try { processingThread?.join(6500) } catch (_: InterruptedException) {}
+        if (processingThread?.isAlive == true) {
+            terminalFailure = true
+            _state.update { it.copy(statusMsg = "Processing did not stop; restart the app") }
+            return // Keep every Image, buffer and Vulkan owner alive until the blocked worker exits.
+        }
+        processingThread = null; sourceQueue = null
+        if (!terminalFailure) { try { engine?.release() } catch (_: Throwable) {}; engine = null }
         try { WsiBridge.stop() } catch (t: Throwable) { Log.w(TAG, "wsi stop: ${t.message}") }
         if (framegenSessionOk) {
             try { FramegenBridge.idle() } catch (_: Throwable) {}

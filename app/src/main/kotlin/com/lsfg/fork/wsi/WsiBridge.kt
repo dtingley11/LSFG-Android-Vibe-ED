@@ -23,6 +23,12 @@ object WsiBridge {
 
     /** Push a native AHardwareBuffer* into the frame queue. */
     external fun nativePushFrame(ahbPtr: Long)
+    external fun nativeRetainBuffer(buffer: HardwareBuffer): HardwareBuffer
+    external fun nativeReserve(ptr: Long): Boolean
+    external fun nativeCancel(ptr: Long)
+    external fun nativeDropped(): Long
+    external fun nativePresentationCounters(): LongArray
+    external fun nativePushTimed(ptr: Long, sourceNs: Long, contentNs: Long, dueNs: Long, externalOwnership: Boolean = false)
 
     external fun nativeSurfaceToWindow(surface: Surface): Long
     external fun nativeReleaseWindow(windowPtr: Long)
@@ -38,7 +44,8 @@ object WsiBridge {
      * (e.g. an ImageReader plane from a MediaProjection VirtualDisplay).
      * srcRowStride is in bytes and may exceed width*4 (plane padding).
      */
-    external fun nativeFillAhb(ahb: HardwareBuffer, bytes: ByteArray, srcRowStride: Int)
+    external fun nativeFillAhb(ahb: HardwareBuffer, bytes: ByteArray, srcRowStride: Int): Boolean
+    external fun nativeFillScaledAhb(ahb: HardwareBuffer, bytes: ByteArray, srcWidth: Int, srcHeight: Int, opaque: Boolean): Boolean
 
     fun start(windowPtr: Long, width: Int, height: Int, targetFps: Float) =
         nativeStart(windowPtr, width, height, targetFps)
@@ -61,7 +68,7 @@ object WsiBridge {
      */
     fun fillAhb(ahb: HardwareBuffer, bytes: ByteArray, srcRowStride: Int): Long {
         try {
-            nativeFillAhb(ahb, bytes, srcRowStride)
+            if (!nativeFillAhb(ahb, bytes, srcRowStride)) return 0L
         } catch (t: Throwable) {
             println("WsiBridge.fillAhb: $t")
             return 0L

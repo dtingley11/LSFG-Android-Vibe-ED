@@ -66,11 +66,9 @@ class TestPattern(private val w: Int, private val h: Int) {
     /** Render the next cube frame and fill the next ring slot. */
     fun next(): HardwareBuffer? {
         if (!running) return null
+        val ahb = ring.firstOrNull { WsiBridge.nativeReserve(WsiBridge.nativeAhbPtr(it)) } ?: return null
         val timeSec = (System.nanoTime() % 1_000_000_000_000L) / 1_000_000_000f
         render(timeSec)
-
-        val ahb = ring[ringIdx % ringSize]
-        ringIdx = (ringIdx + 1) % ringSize
 
         var o = 0
         for (i in px.indices) {
@@ -81,7 +79,7 @@ class TestPattern(private val w: Int, private val h: Int) {
             byteOut[o + 3] = ((c shr 24) and 0xFF).toByte()
             o += 4
         }
-        if (WsiBridge.fillAhb(ahb, byteOut, w * 4) == 0L) return null
+        if (WsiBridge.fillAhb(ahb, byteOut, w * 4) == 0L) { WsiBridge.nativeCancel(WsiBridge.nativeAhbPtr(ahb)); return null }
         return ahb
     }
 
@@ -103,7 +101,7 @@ class TestPattern(private val w: Int, private val h: Int) {
             val g = (14 + 12 * t).toInt()
             val b = (24 + 16 * t).toInt()
             val c = (0xFF000000.toInt() and -16777216) or (b shl 16) or (g shl 8) or r
-            System.arraycopy(IntArray(w) { c }, 0, px, y * w, w)
+            java.util.Arrays.fill(px, y * w, (y + 1) * w, c)
         }
 
         // Moving reference dot (top-left) so simple-motion interpolation is

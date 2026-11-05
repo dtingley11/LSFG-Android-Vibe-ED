@@ -187,6 +187,19 @@ class OverlayController(private val appContext: Context) {
         return s
     }
 
+    /** Keep the Surface alive while letting the original game show through. */
+    fun setOutputVisible(visible: Boolean) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            val view = surfaceView ?: return@post
+            val params = view.layoutParams as? WindowManager.LayoutParams ?: return@post
+            val alpha = if (visible) 1f else 0f
+            if (params.alpha != alpha) {
+                params.alpha = alpha
+                runCatching { wm.updateViewLayout(view, params) }
+            }
+        }
+    }
+
     fun detach() {
         try {
             surfaceView?.let { if (it.parent != null) wm.removeView(it) }
@@ -226,6 +239,7 @@ object OverlayHost {
 
     fun attach(): Boolean = controller().attach()
     fun detach() { controller().detach() }
+    fun setOutputVisible(visible: Boolean) { controller().setOutputVisible(visible) }
 
     /** Current overlay surface (null until attached). A property, so callers
      *  use `OverlayHost.surface` without parentheses. */

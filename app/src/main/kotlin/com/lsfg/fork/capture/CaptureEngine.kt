@@ -8,6 +8,7 @@ import android.graphics.ColorSpace
 import android.graphics.PixelFormat
 import android.hardware.display.VirtualDisplay
 import android.hardware.HardwareBuffer
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import com.lsfg.fork.Log
@@ -58,6 +59,9 @@ class CaptureEngine(
     @Volatile var lastFrameSource: String = ""
 
     private var worker: Thread? = null
+    @Volatile var ownedFrameSink: ((HardwareBuffer, Long, () -> Unit) -> Unit)? = null
+    private var capturedImage: Image? = null
+    private var capturedTimestampNs = 0L
     private val lock = Any()
     private val tmpPath = "/data/local/tmp/lsfg_cap.png"   // shizuku path
     private val rootFile: File = File(appContext.filesDir, "lsfg_cap.png") // root path
@@ -87,7 +91,7 @@ class CaptureEngine(
         PipelineStats.allocations.incrementAndGet()
         return HardwareBuffer.create(
             width, height, PixelFormat.RGBA_8888, 1,
-            HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+            HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_RARELY
         )
     }
 
@@ -121,54 +125,48 @@ class CaptureEngine(
                 while (running) {
                     val t0 = System.currentTimeMillis()
                     try {
+                        PipelineStats.captureStartedNs.set(System.nanoTime())
                         val ahb = PipelineStats.measure("capture") { captureOnce() }
                         if (ahb != null) {
-                            PipelineStats.incAcquired()
-                            val ahbPtr = WsiBridge.nativeAhbPtr(ahb)
-                            val sink = frameSink
-                            val produced = if (sink != null) {
+                            val timestamp = capturedTimestampNs.takeIf { it > 0 } ?: System.nanoTime()
+                            capturedTimestampNs = 0
+                            PipelineStats.sourceFrame(timestamp)
+                            val image = capturedImage.also { capturedImage = null }
+                            val release = { releaseSource(ahb); image?.close(); Unit }
+                            val ownedSink = ownedFrameSink
+                            if (ownedSink != null) {
+                                try { ownedSink(ahb, timestamp, release) }
+                                catch (t: Throwable) { release(); throw t }
+                            } else {
                                 try {
-                                    sink(ahb, ahbPtr)
-                                } catch (t: Throwable) {
-                                    lastError = t.message ?: "framegen failed"
-                                    PipelineStats.incErrors()
-                                    Log.w("CaptureEngine", "frameSink: $lastError")
-                                    0
-                                }
-                            } else 0
-
-                            if (produced <= 0 && ahbPtr != 0L) {
-                                // Passthrough (framegen off / unavailable): present source.
-                                WsiBridge.nativePushFrame(ahbPtr)
-                                PipelineStats.incSubmitted()
+                                    val ptr = WsiBridge.nativeAhbPtr(ahb)
+                                    val produced = frameSink?.invoke(ahb, ptr) ?: 0
+                                    if (produced <= 0 && ptr != 0L) WsiBridge.nativePushFrame(ptr)
+                                } finally { release() }
                             }
                             frames++
                             latencySum += System.currentTimeMillis() - t0
                             consecutiveErrors = 0
-                            releaseSource(ahb)
                         } else {
                             // Capture-by-any-means: if MediaProjection produced
                             // nothing this cycle and we have a root fallback,
                             // use a root screencap so the session still gets frames.
                             var fallbackUsed = false
-                            if (mode == "nonroot" && rootFallback) {
+                            if (mode == "nonroot" && rootFallback && imageReader == null) {
                                 val fb = captureRootFallback()
                                 if (fb != null) {
                                     PipelineStats.incAcquired()
-                                    val ahbPtr = WsiBridge.nativeAhbPtr(fb)
-                                    val sink = frameSink
-                                    val produced = if (sink != null) {
-                                        try { sink(fb, ahbPtr) } catch (t: Throwable) { lastError = t.message; PipelineStats.incErrors(); 0 }
-                                    } else 0
-                                    if (produced <= 0 && ahbPtr != 0L) {
-                                        WsiBridge.nativePushFrame(ahbPtr)
-                                        PipelineStats.incSubmitted()
+                                    val owned = ownedFrameSink
+                                    if (owned != null) owned(fb, System.nanoTime()) { releaseSource(fb) }
+                                    else {
+                                        val ptr = WsiBridge.nativeAhbPtr(fb)
+                                        frameSink?.invoke(fb, ptr) ?: WsiBridge.nativePushFrame(ptr)
+                                        releaseSource(fb)
                                     }
                                     lastFrameSource = "root-fallback"
                                     frames++
                                     latencySum += System.currentTimeMillis() - t0
                                     consecutiveErrors = 0
-                                    releaseSource(fb)
                                     fallbackUsed = true
                                 }
                             }
@@ -215,19 +213,20 @@ class CaptureEngine(
 
     fun stop() {
         synchronized(lock) {
-            if (!running) return
             running = false
         }
         Log.i("CaptureEngine", "stop")
         try { worker?.interrupt() } catch (_: Throwable) {}
         try { worker?.join(800) } catch (_: Throwable) {}
+        check(worker?.isAlive != true) { "Capture worker did not stop" }
         worker = null
-        try { virtualDisplay?.release() } catch (_: Throwable) {}
-        virtualDisplay = null
-        try { imageReader?.close() } catch (_: Throwable) {}
-        imageReader = null
-        try { ShellUtils.fastCmd("rm -f $tmpPath") } catch (_: Throwable) {}
-        try { if (rootFile.exists()) rootFile.delete() } catch (_: Throwable) {}
+    }
+
+    /** Call only after the session's processing queue has relinquished every Image lease. */
+    private fun closeProjectionSurface() {
+        virtualDisplay?.release(); virtualDisplay = null
+        imageReader?.close(); imageReader = null
+        capturedImage?.close(); capturedImage = null
     }
 
     /** Set up MediaProjection -> VirtualDisplay -> ImageReader (nonroot). */
@@ -238,7 +237,7 @@ class CaptureEngine(
             return
         }
         val dpi = if (densityDpi > 0) densityDpi else 320
-        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 4)
+        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 4, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE)
         imageReader = reader
         val vd = proj.createVirtualDisplay(
             "lsfg-capture", width, height, dpi,
@@ -267,25 +266,12 @@ class CaptureEngine(
         }
         val image = reader.acquireLatestImage() ?: return null
         try {
-            val plane = image.planes[0]
-            val buf: ByteBuffer = plane.buffer
-            val n = buf.remaining()
-            if (n < width * height * 4) return null
-            val copyStart = System.nanoTime()
-            val bytes = ByteArray(n)
-            buf.duplicate().get(bytes)
-            val ahb = newSourceAhb()
-            val ptr = WsiBridge.fillAhb(ahb, bytes, plane.rowStride)
-            if (ptr == 0L) {
-                lastError = "nonroot: fillAhb failed"
-                return null
-            }
-            PipelineStats.record("pixelCopy", System.nanoTime() - copyStart)
-            lastFrameSource = "mediaprojection"
-            return ahb
-        } finally {
-            image.close()
-        }
+            val buffer = image.hardwareBuffer ?: run { image.close(); return null }
+            capturedTimestampNs = image.timestamp.takeIf { it > 0 && it <= System.nanoTime() && System.nanoTime() - it < 5_000_000_000L } ?: System.nanoTime()
+            capturedImage = image
+            lastFrameSource = "mediaprojection-ahb"
+            return buffer
+        } catch (t: Throwable) { image.close(); throw t }
     }
 
     /** Root fallback for non-root mode: same screencap->file path as root mode. */
@@ -416,6 +402,7 @@ class CaptureEngine(
 
     fun release() {
         stop()
+        closeProjectionSurface()
     }
 
     /** FPS listener contract shared by the ported Root/Shizuku capture engines. */

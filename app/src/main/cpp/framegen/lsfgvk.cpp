@@ -293,7 +293,7 @@ void Context::dispatch(uint32_t total, bool unsignaled) {
 
     // Increment iteration counter after previous frame is completed
     if (ctx.fence.second) {
-        const auto result{vk.device->waitForFences(*ctx.fence.first, true, UINT64_MAX, *vk.dld)};
+        const auto result{vk.device->waitForFences(*ctx.fence.first, true, 5000000000ULL, *vk.dld)};
         if (result != vk::Result::eSuccess)
             throw std::runtime_error("Unable to wait for completion of previous iteration");
         vk.device->resetFences(*ctx.fence.first, *vk.dld);
@@ -442,7 +442,7 @@ void Context::idle() {
     auto& ctx{*this->m_impl};
     const auto& vk{this->m_impl->instance.get().vk};
 
-    const auto result{vk.device->waitForFences(*ctx.fence.first, true, UINT64_MAX, *vk.dld)};
+    const auto result{vk.device->waitForFences(*ctx.fence.first, true, 5000000000ULL, *vk.dld)};
     if (result != vk::Result::eSuccess)
         throw std::runtime_error("Unable to wait for completion of current iteration");
 }

@@ -15,11 +15,10 @@ object NativeBridge {
 
     /**
      * Session-level frame sink set by SessionManager: receives every captured
-     * frame (framegen drive path). When null (no session / test pattern),
-     * frames go straight to the WSI presenter (passthrough).
+     * frame. Callbacks received after session stop are discarded.
      */
     @Volatile
-    var sessionFrameSink: ((HardwareBuffer) -> Unit)? = null
+    var sessionFrameSink: ((HardwareBuffer, Long) -> Unit)? = null
 
     /**
      * Hands a fresh capture frame (HardwareBuffer) to the pipeline. The
@@ -30,8 +29,7 @@ object NativeBridge {
         val sink = sessionFrameSink
         if (sink != null) {
             try {
-                sink(hardwareBuffer)
-                PipelineStats.incSubmitted()
+                sink(hardwareBuffer, timestampNs)
                 return
             } catch (t: Throwable) {
                 PipelineStats.incDropped()
@@ -39,35 +37,19 @@ object NativeBridge {
                 LsfgLog.w(TAG, "sessionFrameSink threw: ${t.message}")
             }
         }
-        val ptr = WsiBridge.nativeAhbPtr(hardwareBuffer)
-        if (ptr == 0L) {
-            PipelineStats.incDropped()
-            LsfgLog.w(TAG, "pushFrame: AHB ptr == 0 (${hardwareBuffer.width}x${hardwareBuffer.height})")
-            return
-        }
-        WsiBridge.nativePushFrame(ptr)
-        PipelineStats.incSubmitted()
+        // A late Binder callback after stop must not revive the presentation queue.
+        PipelineStats.incDropped()
     }
 
-    /**
-     * Frames produced by framegen since the last session. The fork's
-     * FramegenBridge has no dedicated counter; framegen frames are posted
-     * through the same WSI path, so the posted count already includes them.
-     * 0 here only disables the frame-graph's generated-fps axis.
-     */
-    fun getGeneratedFrameCount(): Long = 0L
+    /** Completed interpolated output copies, excluding original endpoints. */
+    fun getGeneratedFrameCount(): Long = PipelineStats.generated.get()
 
     /** Total frames actually posted to the overlay surface (ground truth). */
     fun getPostedFrameCount(): Long =
         try { WsiBridge.framesPresented() } catch (t: Throwable) { 0L }
 
-    /**
-     * Capture frames whose pixel content differs from the previous capture
-     * (the target app's true render rate). The fork's WSI has no native
-     * dedupe counter yet, so this reports posted frames; the FPS UI is
-     * unaffected in practice because the capture loop paces the source.
-     */
-    fun getUniqueCaptureCount(): Long = getPostedFrameCount()
+    /** Unique game-render frames are not measured by capture callbacks. */
+    fun getUniqueCaptureCount(): Long = 0L
 
     /** Shizuku timing side channel (pacing only, never the visible source). */
     fun reportShizukuTiming(timestampNs: Long, frameTimeNs: Long, pacingJitterNs: Long) {

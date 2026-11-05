@@ -19,28 +19,49 @@ internal class PrivilegedScreenCapture(
     height: Int,
     targetUid: Int,
 ) {
-    private val captureDisplay: Method
-    private val args: Any
-    private val getHardwareBuffer: Method
+    private val captureFrame: () -> HardwareBuffer?
 
     init {
-        val backend = listOf(
-            "android.window.ScreenCapture",
-            "android.view.SurfaceControl",
-        ).firstNotNullOfOrNull { className ->
-            runCatching { buildBackend(className, width, height, targetUid) }
-                .onFailure { Log.w(TAG, "Screen capture backend unavailable: $className", it) }
-                .getOrNull()
-        }
-            ?: throw IllegalStateException("No privileged ScreenCapture backend with UID filter is available")
-        captureDisplay = backend.captureDisplay
-        args = backend.args
-        getHardwareBuffer = backend.getHardwareBuffer
+        captureFrame = runCatching { buildWindowManagerBackend(targetUid) }
+            .onFailure { Log.w(TAG, "WindowManager capture unavailable", it) }.getOrNull()
+            ?: run {
+                val backend = listOf("android.window.ScreenCapture", "android.view.SurfaceControl")
+                    .firstNotNullOfOrNull { className ->
+                        runCatching { buildBackend(className, width, height, targetUid) }
+                            .onFailure { Log.w(TAG, "Screen capture backend unavailable: $className", it) }.getOrNull()
+                    } ?: throw IllegalStateException("No privileged capture backend with UID filtering")
+                val legacyCapture: () -> HardwareBuffer? = { (backend.captureDisplay.invoke(null, backend.args))?.let { backend.getHardwareBuffer.invoke(it) as? HardwareBuffer } }
+                legacyCapture
+            }
     }
 
-    fun captureHardwareBuffer(): HardwareBuffer? {
-        val screenshot = captureDisplay.invoke(null, args) ?: return null
-        return getHardwareBuffer.invoke(screenshot) as? HardwareBuffer
+    fun captureHardwareBuffer(): HardwareBuffer? = captureFrame()
+
+    /** Android 14+ logical-display API avoids private physical display-token APIs. */
+    private fun buildWindowManagerBackend(targetUid: Int): () -> HardwareBuffer? {
+        val screenCapture = Class.forName("android.window.ScreenCapture")
+        val argsClass = Class.forName("android.window.ScreenCapture\$CaptureArgs")
+        val builderClass = Class.forName("android.window.ScreenCapture\$CaptureArgs\$Builder")
+        val listenerClass = Class.forName("android.window.ScreenCapture\$ScreenCaptureListener")
+        val syncClass = Class.forName("android.window.ScreenCapture\$SynchronousScreenCaptureListener")
+        val builder = builderClass.getDeclaredConstructor().newInstance()
+        check(invokeSetUid(builderClass, builder, targetUid.toLong())) { "UID filter unavailable" }
+        invokeOptional(builderClass, builder, "setPixelFormat", intArrayOf(PixelFormat.RGBA_8888))
+        val args = builderClass.getMethod("build").invoke(builder)
+        val global = Class.forName("android.view.WindowManagerGlobal")
+        val wm = global.getMethod("getWindowManagerService").invoke(null)
+        val capture = wm.javaClass.getMethod("captureDisplay", Int::class.javaPrimitiveType, argsClass, listenerClass)
+        capture.isAccessible = true
+        val createListener = screenCapture.getMethod("createSyncCaptureListener")
+        val getBuffer = syncClass.getMethod("getBuffer")
+        val screenshotClass = Class.forName("android.window.ScreenCapture\$ScreenshotHardwareBuffer")
+        val getAhb = screenshotClass.getMethod("getHardwareBuffer")
+        Log.i(TAG, "Using WindowManager captureDisplay with UID filter on logical display 0")
+        return {
+            val listener = createListener.invoke(null)
+            capture.invoke(wm, Display.DEFAULT_DISPLAY, args, listener)
+            getBuffer.invoke(listener)?.let { getAhb.invoke(it) as? HardwareBuffer }
+        }
     }
 
     private fun buildBackend(

@@ -1,72 +1,54 @@
 #include "lsfg_display.h"
-
 #include <android/hardware_buffer.h>
-
-#include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
-
+#include <map>
+#include <mutex>
 namespace {
-    std::mutex g_mutex;
-    std::condition_variable g_cv;
-    std::deque<uintptr_t> g_queue;
-    constexpr size_t kMaxQueue = 64;
+std::mutex mutex;
+std::condition_variable cv;
+std::deque<lsfgdisplay::Frame> queue;
+std::map<uintptr_t, unsigned> busy;
+uint64_t drops = 0;
+constexpr size_t capacity = 4;
+void unmark(uintptr_t p) { auto it = busy.find(p); if (it != busy.end() && --it->second == 0) busy.erase(it); }
+int64_t nowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 }
-
 namespace lsfgdisplay {
-
-void push(uintptr_t ahbPtr) {
-    if (!ahbPtr)
-        return;
-    // Acquire the queue's reference BEFORE enqueueing so the producer may
-    // release its own reference (e.g. close the Java HardwareBuffer) right
-    // after pushing without freeing a buffer that is still queued.
-    AHardwareBuffer_acquire(reinterpret_cast<AHardwareBuffer*>(ahbPtr));
-    uintptr_t dropped{0};
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_queue.size() >= kMaxQueue) {
-            dropped = g_queue.front();
-            g_queue.pop_front(); // drop oldest (backpressure)
-        }
-        g_queue.push_back(ahbPtr);
+bool reserve(uintptr_t p) { std::lock_guard lock(mutex); if (!p || busy.find(p) != busy.end()) return false; busy[p] = 1; return true; }
+void cancel(uintptr_t p) { std::lock_guard lock(mutex); unmark(p); }
+void push(uintptr_t p) { pushTimed({p}, false); }
+void pushTimed(Frame f, bool reserved) {
+    if (!f.ahb) return;
+    AHardwareBuffer_acquire(reinterpret_cast<AHardwareBuffer*>(f.ahb));
+    { std::lock_guard lock(mutex);
+      if (!reserved) ++busy[f.ahb];
+      f.queuedNs = nowNs();
+      if (queue.size() >= capacity) {
+          auto old = queue.front(); queue.pop_front(); ++drops; unmark(old.ahb);
+          AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(old.ahb));
+      }
+      queue.push_back(f);
     }
-    if (dropped)
-        AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(dropped));
-    g_cv.notify_one();
+    cv.notify_one();
 }
-
-uintptr_t pop(int timeoutMs) {
-    std::unique_lock<std::mutex> lock(g_mutex);
-    if (g_queue.empty()) {
-        if (timeoutMs > 0)
-            g_cv.wait_for(lock, std::chrono::milliseconds(timeoutMs));
-        else
-            g_cv.wait(lock, [] { return !g_queue.empty(); });
-    }
-    if (g_queue.empty())
-        return 0;
-    uintptr_t item = g_queue.front();
-    g_queue.pop_front();
-    // The queue's reference is transferred to the caller, who must release it
-    // once the GPU is done with the frame.
-    return item;
+Frame popFrame(int timeoutMs) {
+    std::unique_lock lock(mutex);
+    cv.wait_for(lock, std::chrono::milliseconds(timeoutMs > 0 ? timeoutMs : 1), [] { return !queue.empty(); });
+    if (queue.empty()) return {};
+    auto f = queue.front(); queue.pop_front(); return f;
 }
-
+void complete(uintptr_t p) {
+    { std::lock_guard lock(mutex); unmark(p); }
+    AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(p));
+}
 void clear() {
-    std::deque<uintptr_t> queued;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        queued.swap(g_queue);
-    }
-    for (uintptr_t item : queued)
-        AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(item));
+    std::lock_guard lock(mutex);
+    for (auto f : queue) { unmark(f.ahb); AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(f.ahb)); }
+    queue.clear();
 }
-
-int size() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return static_cast<int>(g_queue.size());
+int size() { std::lock_guard lock(mutex); return int(queue.size()); }
+uint64_t dropped() { std::lock_guard lock(mutex); return drops; }
+void reset() { clear(); std::lock_guard lock(mutex); drops = 0; }
 }
-
-void reset() { clear(); }
-
-} // namespace lsfgdisplay

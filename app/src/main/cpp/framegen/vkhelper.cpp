@@ -653,8 +653,9 @@ void vkhelper::blitImage(
     uint32_t srcLayer,
     const vk::Image& dstImage,
     uint32_t dstLayer,
-    vk::Extent2D extent
+    vk::Extent2D extent, vk::Extent2D dstExtent
 ) {
+    if (!dstExtent.width) dstExtent = extent;
     const vk::ImageBlit blitInfo{
         .srcSubresource = {
             .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -672,7 +673,7 @@ void vkhelper::blitImage(
         },
         .dstOffsets = {{
             vk::Offset3D { 0, 0, 0 },
-            { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 }
+            { static_cast<int32_t>(dstExtent.width), static_cast<int32_t>(dstExtent.height), 1 }
         }}
     };
     cmdbuf.blitImage(

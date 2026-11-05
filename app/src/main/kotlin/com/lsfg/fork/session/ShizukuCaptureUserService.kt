@@ -30,6 +30,8 @@ class ShizukuCaptureUserService : IShizukuCaptureService.Stub() {
     override fun stopCapture() {
         running.set(false)
         worker?.interrupt()
+        worker?.join(4500)
+        check(worker?.isAlive != true) { "Previous Shizuku capture did not stop" }
         worker = null
     }
 

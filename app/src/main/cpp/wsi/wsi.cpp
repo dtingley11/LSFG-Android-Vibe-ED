@@ -13,6 +13,7 @@
 #include "lsfg_display.h"
 #include "jnifile_log.h"
 #include "perf_metrics.h"
+#include "rgba_copy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -183,6 +184,7 @@ namespace {
 
         std::atomic<float> targetFps{60.0f};
         std::atomic<uint64_t> framesPresented{0};
+        std::atomic<uint64_t> scheduled{0}, missed{0}, stale{0};
         bool constructed{false};
     };
 
@@ -199,12 +201,16 @@ namespace {
     // -> AHardwareBuffer_lock -> Gralloc3Mapper::lock).  The presenter holds a
     // buffer's lock until its present fence signals (GPU done reading it), so
     // the producer cannot CPU-write a buffer the GPU is still reading.
-    std::map<uintptr_t, std::shared_ptr<std::mutex>> g_ahb_locks;
+    std::map<uintptr_t, std::weak_ptr<std::mutex>> g_ahb_locks;
     std::mutex g_ahb_locks_guard;
     std::shared_ptr<std::mutex> getAhbLock(uintptr_t ahbKey) {
         std::lock_guard<std::mutex> g(g_ahb_locks_guard);
         auto it = g_ahb_locks.find(ahbKey);
-        if (it != g_ahb_locks.end()) return it->second;
+        if (it != g_ahb_locks.end()) { if (auto existing = it->second.lock()) return existing; }
+        if (g_ahb_locks.size() > 64) {
+            for (auto entry = g_ahb_locks.begin(); entry != g_ahb_locks.end(); )
+                if (entry->second.expired()) entry = g_ahb_locks.erase(entry); else ++entry;
+        }
         auto m = std::make_shared<std::mutex>();
         g_ahb_locks[ahbKey] = m;
         return m;
@@ -243,8 +249,10 @@ namespace {
     // it. This is a bounded, documented terminal-failure leak, preferred over
     // use-after-free or undefined behavior. Normal shutdown (gpuFailure false)
     // destroys everything.
+    std::atomic<bool> g_terminalFailure{false};
     static void teardownVulkanResources() {
         if (g_presenter.gpuFailure) {
+            g_terminalFailure = true;
             WLOGE("GPU failure: retaining Vulkan device/instance, pool, fence, swapchain, "
                    "%zu import(s) and pending command buffer until process exit",
                    g_presenter.ahbImports.size());
@@ -485,7 +493,7 @@ namespace {
 
     // *outFresh (when non-null) reports whether this call created a new import
     // (false = cache hit on a previously imported buffer).
-    VkImage importAhbLocked(const void* ahb, bool* outFresh = nullptr) {
+    VkImage importAhbLocked(const void* ahb, bool* outFresh = nullptr, bool externalOwnership = false) {
         uintptr_t key = reinterpret_cast<uintptr_t>(ahb);
         auto it = g_presenter.ahbImports.find(key);
         if (it != g_presenter.ahbImports.end()) {
@@ -525,56 +533,49 @@ namespace {
             }
         } guard{image, mem, view, recorded};
 
+        VkAndroidHardwareBufferFormatPropertiesANDROID formatProps{};
+        formatProps.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+        VkAndroidHardwareBufferPropertiesANDROID props{};
+        props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+        props.pNext = &formatProps;
+        VK_CHECK(vkGetAndroidHardwareBufferPropertiesANDROID(g_presenter.device, buffer, &props));
+        if (formatProps.format != VK_FORMAT_R8G8B8A8_UNORM || !props.memoryTypeBits)
+            throw std::runtime_error("Presenter requires importable RGBA8888 capture");
+        VkExternalMemoryImageCreateInfo externalInfo{};
+        externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.pNext = &externalInfo;
         ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = fmt;
-        ici.extent = { static_cast<uint32_t>(desc.width), static_cast<uint32_t>(desc.height), 1 };
+        ici.format = formatProps.format;
+        ici.extent = { desc.width, desc.height, 1 };
         ici.mipLevels = 1;
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
         ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
         VK_CHECK(vkCreateImage(g_presenter.device, &ici, nullptr, &image));
         guard.image = image;
-
-        VkAndroidHardwareBufferPropertiesANDROID props{};
-        props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
-        vkGetAndroidHardwareBufferPropertiesANDROID(g_presenter.device, buffer, &props);
-
-        VkMemoryRequirements mreq;
-        vkGetImageMemoryRequirements(g_presenter.device, image, &mreq);
-
-        uint32_t usable = mreq.memoryTypeBits & props.memoryTypeBits;
-        if (!usable) usable = mreq.memoryTypeBits;
         uint32_t memTypeIndex = 0;
-        for (uint32_t i = 0; i < 64; ++i) {
-            if (usable & (1u << i)) { memTypeIndex = i; break; }
-        }
-
+        while (!(props.memoryTypeBits & (1u << memTypeIndex))) ++memTypeIndex;
+        VkMemoryDedicatedAllocateInfo dedicated{};
+        dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        dedicated.image = image;
         VkImportAndroidHardwareBufferInfoANDROID importInfo{};
         importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
         importInfo.buffer = buffer;
+        importInfo.pNext = &dedicated;
 
         VkMemoryAllocateInfo mai{};
         mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.pNext = &importInfo;
-        mai.allocationSize = mreq.size;
+        mai.allocationSize = props.allocationSize;
         mai.memoryTypeIndex = memTypeIndex;
         VK_CHECK(vkAllocateMemory(g_presenter.device, &mai, nullptr, &mem));
         guard.mem = mem;
         VK_CHECK(vkBindImageMemory(g_presenter.device, image, mem, 0));
-
-        VkImageViewCreateInfo vci{};
-        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        vci.image = image;
-        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format = fmt;
-        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VK_CHECK(vkCreateImageView(g_presenter.device, &vci, nullptr, &view));
-        guard.view = view;
 
         Presenter::AhbImport imp;
         imp.image = image;
@@ -597,18 +598,20 @@ namespace {
         //   ahbImports and is retained by the terminal-failure teardown (the
         //   GPU may still be transitioning it), so it must NOT be destroyed
         //   here or by releasePoppedFrame.
-        transitionToGeneral(image);
+        if (!externalOwnership) transitionToGeneral(image);
         return image;
     }
 
     void presentLoop() {
         int64_t lastPresented = 0;
+        int64_t nextPresentNs = 0;
         using namespace std::chrono_literals;
         while (g_presenter.running) {
             // Pop a source frame (non-blocking-ish, with a short timeout so the
             // loop can also service 'paused' and shutdown promptly).
             int waitMs = std::max(1, static_cast<int>(1000.0 / g_presenter.targetFps.load()));
-            uintptr_t frame = lsfgdisplay::pop(waitMs);
+            auto queued = lsfgdisplay::popFrame(waitMs);
+            uintptr_t frame = queued.ahb;
             if (!frame) {
                 if (g_presenter.paused) std::this_thread::sleep_for(5ms);
                 continue;
@@ -633,9 +636,17 @@ namespace {
                         g_presenter.ahbImports.erase(iit);
                     }
                 }
-                AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(frame));
+                lsfgdisplay::complete(frame);
             };
-            if (!g_presenter.surfaceValid) { releasePoppedFrame(); continue; }
+            auto now = lsfgperf::nowNs();
+
+            // A bounded processing-age budget rejects obsolete captures instead of building latency.
+            if (queued.sourceNs && now - queued.sourceNs > 120000000LL) { g_presenter.stale++; releasePoppedFrame(); continue; }
+            if (queued.dueNs > now) {
+                while (g_presenter.running && lsfgperf::nowNs() < queued.dueNs)
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+            if (g_presenter.paused || !g_presenter.running || !g_presenter.surfaceValid) { releasePoppedFrame(); continue; }
 
             // Hold this frame's AHB lock for the whole GPU read (import + copy
             // + submit + fence wait) so the producer thread cannot CPU-fill
@@ -647,9 +658,16 @@ namespace {
             std::shared_ptr<std::mutex> ahbLock = getAhbLock(frame);
             std::unique_lock<std::mutex> ahbGuard(*ahbLock);
 
+            if (nextPresentNs > lsfgperf::nowNs()) {
+                while (g_presenter.running && lsfgperf::nowNs() < nextPresentNs)
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+            if (!g_presenter.running || (queued.sourceNs && lsfgperf::nowNs() - queued.sourceNs > 120000000LL)) { releasePoppedFrame(); continue; }
+            nextPresentNs = lsfgperf::nowNs() + int64_t(1e9 / g_presenter.targetFps.load());
+            lsfgperf::metrics.record(lsfgperf::QueueAge, lsfgperf::nowNs() - queued.queuedNs);
             VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
             try {
-                VkImage srcImage = importAhbLocked(reinterpret_cast<const void*>(frame), &freshImport);
+                VkImage srcImage = importAhbLocked(reinterpret_cast<const void*>(frame), &freshImport, queued.externalOwnership);
                 if (!srcImage) { releasePoppedFrame(); continue; }
 
                 // Non-blocking acquire: 0 timeout returns VK_TIMEOUT if the
@@ -723,6 +741,19 @@ namespace {
                 AHardwareBuffer_Desc desc{};
                 AHardwareBuffer_describe(const_cast<AHardwareBuffer*>(reinterpret_cast<const AHardwareBuffer*>(frame)), &desc);
 
+                VkImageMemoryBarrier externalAcquire{};
+                if (queued.externalOwnership) {
+                    externalAcquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    externalAcquire.oldLayout = externalAcquire.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    externalAcquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+                    externalAcquire.dstQueueFamilyIndex = g_presenter.qfi;
+                    externalAcquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    externalAcquire.image = srcImage;
+                    externalAcquire.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &externalAcquire);
+                }
+
                 // CRITICAL FIX: clamp the copy extent to the MIN of the source
                 // AHB and the swapchain image.  The old code used the AHB extent
                 // (full resolution) unconditionally; when the AHB is larger than
@@ -741,6 +772,16 @@ namespace {
                 vkCmdCopyImage(cmdbuf, srcImage, VK_IMAGE_LAYOUT_GENERAL,
                     g_presenter.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
+                if (queued.externalOwnership) {
+                    auto release = externalAcquire;
+                    release.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    release.dstAccessMask = 0;
+                    release.srcQueueFamilyIndex = g_presenter.qfi;
+                    release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+                    vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &release);
+                }
+
                 ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 ib.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
                 ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -749,7 +790,7 @@ namespace {
 
                 vkEndCommandBuffer(cmdbuf);
 
-                VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
                 VkSubmitInfo si{};
                 si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 si.waitSemaphoreCount = 1;
@@ -784,6 +825,10 @@ namespace {
                 pi.pImageIndices = indices;
                 // A failed present must not be counted as a presented frame.
                 const auto presentStart = lsfgperf::nowNs();
+                if (queued.dueNs > 0) {
+                    g_presenter.scheduled++;
+                    if (presentStart > queued.dueNs + int64_t(.5e9 / g_presenter.targetFps.load())) g_presenter.missed++;
+                }
                 VkResult pr = vkQueuePresentKHR(g_presenter.queue, &pi);
                 lsfgperf::metrics.record(lsfgperf::PresentCall, lsfgperf::nowNs() - presentStart);
                 if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) {
@@ -834,6 +879,7 @@ namespace {
                 releasePoppedFrame();
                 if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) {
                     const auto now = lsfgperf::nowNs();
+                    if (queued.sourceNs) lsfgperf::metrics.record(lsfgperf::Latency, now - queued.sourceNs);
                     if (lastPresented) lsfgperf::metrics.record(lsfgperf::PresentInterval, now - lastPresented);
                     lastPresented = now;
                     g_presenter.framesPresented++;
@@ -857,7 +903,7 @@ extern "C" {
 JNIEXPORT void JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativeStart(JNIEnv* env, jclass, jlong windowPtr, jint width, jint height, jfloat targetFps) {
     std::lock_guard<std::mutex> lock(g_initLock);
-    if (g_presenter.running) return;
+    if (g_presenter.running || g_terminalFailure.load()) return;
     installCrashHandler();  // install once, before any Vulkan/driver work
     try {
         WLOG("starting presenter %dx%d targetFps=%.1f", width, height, static_cast<double>(targetFps));
@@ -947,6 +993,7 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeStart(JNIEnv* env, jclass, jlong windowPt
             winW = static_cast<int32_t>(width);
             winH = static_cast<int32_t>(height);
         }
+        g_presenter.scheduled = 0; g_presenter.missed = 0; g_presenter.stale = 0;
         g_presenter.targetFps = targetFps > 1.0f ? targetFps : 60.0f;
         createSwapchain(static_cast<uint32_t>(winW), static_cast<uint32_t>(winH));
 
@@ -981,6 +1028,7 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeIsRunning(JNIEnv*, jclass) {
 JNIEXPORT void JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativeSetPaused(JNIEnv*, jclass, jboolean paused) {
     g_presenter.paused = paused ? JNI_TRUE : JNI_FALSE;
+    if (paused) lsfgdisplay::clear();
 }
 
 JNIEXPORT void JNICALL
@@ -1024,36 +1072,78 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeFramesPresented(JNIEnv*, jclass) {
  * (e.g. an ImageReader RGBA_8888 plane from a MediaProjection VirtualDisplay).
  * Copies row by row, respecting the source row stride.
  */
+JNIEXPORT jlongArray JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativePresentationCounters(JNIEnv* env, jclass) {
+    const jlong values[] = { jlong(g_presenter.scheduled.load()), jlong(g_presenter.missed.load()),
+        jlong(lsfgdisplay::dropped()), jlong(g_presenter.stale.load()) };
+    auto out = env->NewLongArray(4); if (out) env->SetLongArrayRegion(out, 0, 4, values); return out;
+}
+JNIEXPORT jobject JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeRetainBuffer(JNIEnv* env, jclass, jobject buffer) {
+    auto* ahb = AHardwareBuffer_fromHardwareBuffer(env, buffer);
+    return ahb ? AHardwareBuffer_toHardwareBuffer(env, ahb) : nullptr;
+}
+JNIEXPORT jboolean JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeReserve(JNIEnv*, jclass, jlong p) { return lsfgdisplay::reserve(p); }
 JNIEXPORT void JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeCancel(JNIEnv*, jclass, jlong p) { lsfgdisplay::cancel(p); }
+JNIEXPORT jlong JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeDropped(JNIEnv*, jclass) { return lsfgdisplay::dropped(); }
+JNIEXPORT void JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativePushTimed(JNIEnv*, jclass, jlong p, jlong source, jlong content, jlong due, jboolean externalOwnership) {
+    lsfgdisplay::pushTimed({uintptr_t(p), source, content, due, 0, externalOwnership == JNI_TRUE}, true);
+}
+
+JNIEXPORT jboolean JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativeFillAhb(
         JNIEnv* env, jclass, jobject ahbObj, jbyteArray bytes, jint srcRowStride) {
-    if (!ahbObj || !bytes || srcRowStride <= 0) return;
-    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, ahbObj);
-    if (!ahb) return;
+    if (!ahbObj || !bytes || srcRowStride <= 0) return JNI_FALSE;
+    auto* ahb = AHardwareBuffer_fromHardwareBuffer(env, ahbObj);
+    if (!ahb) return JNI_FALSE;
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb, &desc);
-    if (desc.width == 0 || desc.height == 0) return;
-    // Serialize this CPU fill against the presenter's GPU read of the SAME
-    // buffer (see getAhbLock).  The producer must not AHardwareBuffer_lock a
-    // buffer the present thread is still importing/copying via Vulkan.
-    std::shared_ptr<std::mutex> ahbLock = getAhbLock(reinterpret_cast<uintptr_t>(ahb));
-    std::lock_guard<std::mutex> ahbGuard(*ahbLock);
+    const uint64_t rowBytes = uint64_t(desc.width) * 4;
+    const uint64_t required = desc.height ? uint64_t(desc.height - 1) * srcRowStride + rowBytes : 0;
+    if (!desc.width || !desc.height || desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ||
+        uint64_t(srcRowStride) < rowBytes || required > uint64_t(env->GetArrayLength(bytes))) return JNI_FALSE;
+    auto ahbLock = getAhbLock(reinterpret_cast<uintptr_t>(ahb));
+    std::lock_guard<std::mutex> guard(*ahbLock);
     void* data = nullptr;
-    AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY,
-                         /*fence*/ 0, /*rect*/ nullptr, &data);
-    if (!data) return;
-    uint8_t* src = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(bytes, nullptr));
+    if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY, -1, nullptr, &data) || !data)
+        return JNI_FALSE;
+    auto* src = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(bytes, nullptr));
     if (src) {
-        const uint32_t rowBytes = desc.width * 4; // RGBA8888 (4 bytes/pixel)
-        uint8_t* d = static_cast<uint8_t*>(data);
-        for (uint32_t y = 0; y < desc.height; ++y) {
-            std::memcpy(d + y * static_cast<size_t>(desc.stride),
-                        src + y * static_cast<size_t>(srcRowStride),
-                        rowBytes);
-        }
+        lsfgpixels::copyRows(static_cast<uint8_t*>(data), size_t(desc.stride) * 4,
+            src, srcRowStride, desc.width, desc.height);
         env->ReleasePrimitiveArrayCritical(bytes, src, JNI_ABORT);
     }
-    AHardwareBuffer_unlock(ahb, nullptr);
+    const int result = AHardwareBuffer_unlock(ahb, nullptr);
+    return src && !result ? JNI_TRUE : JNI_FALSE;
+}
+
+// Raw screencap is packed RGBA/RGBX. Scale while copying, without a Bitmap or ARGB array.
+JNIEXPORT jboolean JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeFillScaledAhb(
+        JNIEnv* env, jclass, jobject ahbObj, jbyteArray bytes, jint sw, jint sh, jboolean opaque) {
+    if (!ahbObj || !bytes || sw <= 0 || sh <= 0 ||
+        uint64_t(sw) * sh * 4 > uint64_t(env->GetArrayLength(bytes))) return JNI_FALSE;
+    auto* ahb = AHardwareBuffer_fromHardwareBuffer(env, ahbObj);
+    if (!ahb) return JNI_FALSE;
+    AHardwareBuffer_Desc d{};
+    AHardwareBuffer_describe(ahb, &d);
+    if (!d.width || !d.height || d.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) return JNI_FALSE;
+    auto ahbLock = getAhbLock(reinterpret_cast<uintptr_t>(ahb));
+    std::lock_guard<std::mutex> guard(*ahbLock);
+    void* data = nullptr;
+    if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY, -1, nullptr, &data) || !data)
+        return JNI_FALSE;
+    auto* src = static_cast<uint32_t*>(env->GetPrimitiveArrayCritical(bytes, nullptr));
+    if (src) {
+        lsfgpixels::copyScaled(static_cast<uint32_t*>(data), d.stride, d.width, d.height, src, sw, sh, opaque);
+        env->ReleasePrimitiveArrayCritical(bytes, src, JNI_ABORT);
+    }
+    const int result = AHardwareBuffer_unlock(ahb, nullptr);
+    return src && !result ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL

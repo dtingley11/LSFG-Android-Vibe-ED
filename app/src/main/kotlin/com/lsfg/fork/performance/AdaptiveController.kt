@@ -46,12 +46,13 @@ class AdaptiveController {
     private var sourceEma = 0.0
     private var good = 0
     private var bad = 0
+    private var nextIncreaseMs = 0L
     private var previousMode: OperatingMode? = null
 
     fun reset() {
         decision = SmoothnessDecision(1, 30.0, "Measuring capture and processing")
         startedMs = -1; lastChangeMs = -1; lastSampleMs = -1
-        sourceEma = 0.0; good = 0; bad = 0; previousMode = null
+        sourceEma = 0.0; good = 0; bad = 0; nextIncreaseMs = 0; previousMode = null
     }
 
     fun update(s: PerformanceSample, settings: SmoothnessSettings): SmoothnessDecision {
@@ -78,7 +79,7 @@ class AdaptiveController {
         val overloaded = hot || jitter > .65 || (gpu != null && gpu > ceiling + 2) ||
             s.missedFraction > .12 || s.queueDepth > 2 || s.queueAgeMs > settings.maxLatencyMs ||
             s.latencyP95Ms > settings.maxLatencyMs || s.processingP95Ms > period * .9
-        val healthy = !overloaded && jitter < .25 && s.missedFraction <= .03 &&
+        val healthy = !overloaded && jitter < .35 && s.missedFraction <= .03 &&
             s.queueDepth <= 1 && s.processingP95Ms > 0 && s.processingP95Ms < period * .65 &&
             s.latencyP95Ms < settings.maxLatencyMs * .8 && (gpu == null || gpu < ceiling - 8)
         good = if (healthy) good + 1 else 0
@@ -94,14 +95,15 @@ class AdaptiveController {
 
         val modeChanged = previousMode != settings.mode
         previousMode = settings.mode
-        if (critical || source < 12 || (source >= refresh * .93 && jitter < .1))
+        if (critical || source < 12 || (source >= min(refresh, limit) * .95 && jitter < .35))
             return change(1, min(source, limit), when {
                 critical -> "Thermal protection"
                 source < 12 -> "Capture too slow for responsive interpolation"
-                else -> "Source already near display refresh"
+                else -> "Capture rate already reaches output limit"
             })
 
-        if (critical || bad >= 2) {
+        if (bad >= 2) {
+            nextIncreaseMs = maxOf(nextIncreaseMs, s.nowMs + 30_000)
             good = 0
             return change(max(1, decision.multiplier - 1),
                 min(decision.targetFps, source * max(1, decision.multiplier - 1)), when {
@@ -131,13 +133,14 @@ class AdaptiveController {
         val capacityPerOutputMs = s.processingP95Ms / decision.multiplier
         val estimatedCost = capacityPerOutputMs * desiredMultiplier
         val stablePresentation = decision.multiplier == 1 || s.presentFps >= min(decision.targetFps, source * decision.multiplier) * .85
-        if (good >= 3 && stablePresentation && estimatedCost <= period * .8 && !overloaded) {
+        if (s.nowMs >= nextIncreaseMs && good >= 3 && stablePresentation && estimatedCost <= period * .8 && !overloaded) {
             val nextMultiplier = min(desiredMultiplier, decision.multiplier + 1)
             val target = min(requested, source * nextMultiplier)
             return change(nextMultiplier, target, if (gpu == null) "Adapting from frame timing; GPU load unavailable" else "Stable pacing within total GPU budget")
         }
         return decision.copy(reason = when {
             gpu != null && gpu >= ceiling - 8 -> "Maintaining GPU headroom"
+            s.nowMs < nextIncreaseMs -> "Holding reduced work after overload"
             !stablePresentation -> "Waiting for stable presentation"
             else -> "Maintaining sustainable output"
         }).also { decision = it }

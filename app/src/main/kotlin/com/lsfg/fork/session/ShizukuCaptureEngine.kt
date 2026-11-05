@@ -266,10 +266,12 @@ class ShizukuCaptureEngine(
 
     private val frameCallback = object : IShizukuFrameCallback.Stub() {
         override fun onFrame(buffer: HardwareBuffer, timestampNs: Long) {
+            if (pendingStart == null) { buffer.close(); return }
             fpsFrameCount++
             graphFrameCount++
             try {
                 if (!metricsOnly) {
+                    PipelineStats.sourceFrame(timestampNs)
                     NativeBridge.pushFrame(buffer, timestampNs)
                 }
             } catch (t: Throwable) {
@@ -285,11 +287,12 @@ class ShizukuCaptureEngine(
 
         override fun onCaptureMetrics(startedNs: Long, captureNs: Long, commandNs: Long,
             readNs: Long, decodeNs: Long, copyNs: Long, backend: String?) {
+            PipelineStats.captureStartedNs.set(startedNs)
             PipelineStats.record("capture", captureNs)
             if (commandNs >= 0) PipelineStats.record("screenshotCommand", commandNs)
             if (readNs >= 0) PipelineStats.record("fileRead", readNs)
             if (decodeNs >= 0) PipelineStats.record("decode", decodeNs)
-            if (copyNs >= 0) PipelineStats.record("pixelCopy", copyNs)
+            if (copyNs >= 0) { PipelineStats.allocations.incrementAndGet(); PipelineStats.record("pixelCopy", copyNs) }
         }
 
         override fun onFrameMetrics(timestampNs: Long, frameTimeNs: Long, pacingJitterNs: Long) {

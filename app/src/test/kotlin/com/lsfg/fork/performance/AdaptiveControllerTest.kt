@@ -89,6 +89,20 @@ class AdaptiveControllerTest {
         assertEquals(1, c.update(sample(0), SmoothnessSettings()).multiplier)
         assertEquals(1, c.update(sample(1000, Double.NaN), SmoothnessSettings()).multiplier)
     }
+    @Test fun captureAlreadyAtCapDoesNotTriggerUnnecessaryCeilingRounding() {
+        val c = AdaptiveController()
+        for (i in 0..25) {
+            val d = c.update(sample(i * 1000L, source = 89.5), SmoothnessSettings(targetLimit = 90.0))
+            assertEquals(1, d.multiplier)
+        }
+    }
+    @Test fun failedProbeDoesNotRepeatEveryFiveSeconds() {
+        val c = AdaptiveController(); warm(c)
+        c.update(sample(21_000).copy(missedFraction = .3), SmoothnessSettings())
+        val reduced = c.update(sample(22_000).copy(missedFraction = .3), SmoothnessSettings())
+        for (i in 23..45) assertTrue(c.update(sample(i * 1000L), SmoothnessSettings()).multiplier <= reduced.multiplier)
+        assertTrue(c.update(sample(53_000), SmoothnessSettings()).multiplier >= reduced.multiplier)
+    }
     @Test fun fractionalOutputSelectionDoesNotInventInterpolationOrDuplicateFrames() {
         val cadence = OutputCadence()
         var selected = 0

@@ -1,5 +1,7 @@
 package com.lsfg.fork.framegen
 
+import android.hardware.HardwareBuffer
+
 /** JNI bridge for the LSFG v3_1 compute pipeline (framegen). */
 object FramegenBridge {
 
@@ -10,10 +12,12 @@ object FramegenBridge {
         width: Int, height: Int, flowScale: Float, performance: Boolean
     ): Boolean
 
-    private external fun nativeWriteSource(handle: Long, srcAhb: Long, slot: Int)
-    private external fun nativeDispatch(handle: Long, total: Int)
-    private external fun nativeAcquire(handle: Long)
-    private external fun nativeAcquireToDst(handle: Long, dstAhb: Long)
+    private external fun nativeCreateOutputBuffers(handle: Long, width: Int, height: Int, count: Int): Array<HardwareBuffer>?
+    private external fun nativeWriteSource(handle: Long, srcAhb: Long, slot: Int): Boolean
+    private external fun nativeDispatch(handle: Long, total: Int): Boolean
+    private external fun nativeAcquire(handle: Long): Boolean
+    private external fun nativeAcquireToDst(handle: Long, dstAhb: Long): Boolean
+    private external fun nativeCopySource(handle: Long, srcAhb: Long, dstAhb: Long): Boolean
     private external fun nativeIdle(handle: Long)
     private external fun nativeDestroy(handle: Long)
 
@@ -71,29 +75,41 @@ object FramegenBridge {
         }
     }
 
+    /** Null means AHB export is unsupported or allocation failed before any GPU submission. */
+    @Synchronized
+    fun createOutputBuffers(width: Int, height: Int, count: Int): Array<HardwareBuffer>? {
+        if (instance == 0L) return null
+        return nativeCreateOutputBuffers(instance, width, height, count)
+    }
+
     @Synchronized
     fun writeSource(srcAhb: Long, slot: Int) {
-        if (instance == 0L) return
-        try { nativeWriteSource(instance, srcAhb, slot) } catch (_: Throwable) {}
+        check(instance != 0L) { "Frame generation is unavailable" }
+        check(nativeWriteSource(instance, srcAhb, slot)) { "Frame generation failed; restart the app before retrying" }
     }
 
     @Synchronized
     fun dispatch(total: Int) {
-        if (instance == 0L) return
-        try { nativeDispatch(instance, total) } catch (_: Throwable) {}
+        check(instance != 0L) { "Frame generation is unavailable" }
+        check(nativeDispatch(instance, total)) { "Frame generation failed; restart the app before retrying" }
     }
 
     @Synchronized
     fun acquire() {
         if (instance == 0L) return
-        try { nativeAcquire(instance) } catch (_: Throwable) {}
+        check(nativeAcquire(instance)) { "Frame generation failed; restart the app" }
     }
 
     /** Acquire the next generated frame and blit it into the shared dst AHB. */
     @Synchronized
     fun acquireToDst(dstAhb: Long) {
-        if (instance == 0L) return
-        try { nativeAcquireToDst(instance, dstAhb) } catch (_: Throwable) {}
+        check(instance != 0L) { "Frame generation is unavailable" }
+        check(nativeAcquireToDst(instance, dstAhb)) { "Frame generation failed; restart the app before retrying" }
+    }
+
+    @Synchronized
+    fun copySource(src: Long, dst: Long) {
+        check(instance != 0L && nativeCopySource(instance, src, dst)) { "Source copy failed; restart the app before retrying" }
     }
 
     @Synchronized
