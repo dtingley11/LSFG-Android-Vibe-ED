@@ -167,22 +167,57 @@ Pipeline::Pipeline(
             if (image.signature.flags & (ImageFlag::ExternalInput | ImageFlag::ExternalOutput)) {
                 const bool isInputOr{image.signature.flags & ImageFlag::ExternalInput};
 
+                // External input/output images need TRANSFER usage on top of the
+                // compute usages: the input is the copy destination of each
+                // captured frame, the output is the copy source for presentation.
+                const vk::ImageUsageFlags externalUsage{
+                    usage |
+                    (isInputOr ?
+                        vk::ImageUsageFlagBits::eTransferDst :
+                        vk::ImageUsageFlagBits::eTransferSrc)
+                };
+
+#if defined(__ANDROID__)
+                // AHardwareBuffer export handles are the ONLY cross-VkDevice share
+                // that works on this Adreno driver. An opaque fd exported by this
+                // device cannot be imported by the presenter's separate device
+                // (vkGetMemoryFdPropertiesKHR reports memoryTypeBits 0x0), but an
+                // AHB can, and the presenter already imports AHBs successfully for
+                // reading. Export the OUTPUT that way so the presenter reads the
+                // pipeline's own image and nothing ever writes into an app buffer.
+                //
+                // The input keeps the opaque-fd type: it is filled by us via AHB
+                // import, never shared outward, and changing it would only risk
+                // the memory-type intersection we already fixed.
+                const bool ahbExport{!isInputOr && vkhelper::supportsAhbExport(
+                    dld, physdev, imageExtent, format, externalUsage
+                )};
+                const vk::ExternalMemoryHandleTypeFlagBits exportType{
+                    ahbExport ?
+                        vk::ExternalMemoryHandleTypeFlagBits::eAndroidHardwareBufferANDROID :
+                        vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+                };
+#else
+                const bool ahbExport{false};
+                const vk::ExternalMemoryHandleTypeFlagBits exportType{
+                    vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+                };
+#endif
+
                 auto subimage{vkhelper::createImage(
                     dld,
                     device,
                     imageExtent,
                     format,
                     image.signature.count,
-                    usage |
-                        (isInputOr ?
-                            vk::ImageUsageFlagBits::eTransferDst
-                            : vk::ImageUsageFlagBits::eTransferSrc),
-                    true
+                    externalUsage,
+                    true,
+                    exportType
                 )};
                 const auto requirements{device.getImageMemoryRequirements(*subimage, dld)};
 
                 const vk::ExportMemoryAllocateInfo exportInfo{
-                    .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+                    .handleTypes = exportType
                 };
                 const vk::MemoryDedicatedAllocateInfo dedicatedInfo{
                     .pNext = &exportInfo,
@@ -214,12 +249,14 @@ Pipeline::Pipeline(
                         .format = format,
                         .layers = image.signature.count,
                         .image = *subimage,
-                        .memory = *allocation
+                        .memory = *allocation,
+                        .ahbExportable = ahbExport
                     });
                 }
 
                 LOG() << "  Allocated memory of size " << requirements.size
-                    << " for external image " << imageIdx;
+                    << " for external image " << imageIdx
+                    << (ahbExport ? " (AHB-exportable)" : " (fd)");
 
                 image.subimages.push_back({
                     .image = std::move(subimage)

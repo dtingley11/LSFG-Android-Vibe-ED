@@ -54,6 +54,9 @@ fun ConfigScreen(onStart: () -> Unit) {
     }
     var probeBusy by remember { mutableStateOf(false) }
     var probeResult by remember { mutableStateOf<RootChecker.ProbeResult?>(null) }
+    // Shizuku availability, so the Shizuku row reports something truthful.
+    var shizukuInstalled by remember { mutableStateOf(false) }
+    var shizukuRunning by remember { mutableStateOf(false) }
 
     fun refreshPerms() {
         overlayGranted = android.provider.Settings.canDrawOverlays(ctx)
@@ -61,6 +64,14 @@ fun ConfigScreen(onStart: () -> Unit) {
             (ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED)
         else true
+        // Best-effort probe; wrapped so a failure can never break the card.
+        try {
+            shizukuInstalled = com.lsfg.fork.ShellBridge.shizukuInstalled()
+            shizukuRunning = shizukuInstalled && com.lsfg.fork.ShellBridge.shizukuRunning()
+        } catch (_: Throwable) {
+            shizukuInstalled = false
+            shizukuRunning = false
+        }
     }
 
     // CRITICAL FIX (bug: "Grant the permissions above first" always shows):
@@ -95,57 +106,86 @@ fun ConfigScreen(onStart: () -> Unit) {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("Permissions", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Display over other apps (overlay)", style = MaterialTheme.typography.bodyMedium)
-                    StatusChip(ok = overlayGranted)
-                }
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Notifications (Android 13+)", style = MaterialTheme.typography.bodyMedium)
-                    StatusChip(ok = notifGranted)
-                }
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    val mpOk = s.captureMode != "nonroot" || SessionManager.pendingProjectionData != null
-                    Text("Screen capture (nonroot only)", style = MaterialTheme.typography.bodyMedium)
-                    StatusChip(ok = mpOk, muted = s.captureMode != "nonroot")
-                }
-
-                Button(
-                    onClick = {
-                        refreshPerms()
-                        Log.i("Config", "refresh permissions")
+                PermissionRow(
+                    label = "Display over other apps (overlay)",
+                    detail = "Required for every capture mode. Draws the frame-generated overlay.",
+                    state = if (overlayGranted) PermState.OK else PermState.MISSING
+                )
+                PermissionRow(
+                    label = "Notifications (Android 13+)",
+                    detail = "Required for every capture mode. Keeps the capture service alive.",
+                    state = if (notifGranted) PermState.OK else PermState.MISSING
+                )
+                PermissionRow(
+                    label = "Screen capture (non-root mode only)",
+                    detail = when {
+                        s.captureMode != "nonroot" -> "Not needed: you are using the ${s.captureMode} mode."
+                        SessionManager.pendingProjectionData != null -> "MediaProjection consent recorded."
+                        else -> "Tap Start session and accept the system capture dialog."
                     },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = accent, contentColor = Color(0xFF001418))
-                ) { Text("Refresh permissions") }
+                    state = when {
+                        s.captureMode != "nonroot" -> PermState.NOT_NEEDED
+                        SessionManager.pendingProjectionData != null -> PermState.OK
+                        else -> PermState.MISSING
+                    }
+                )
+                PermissionRow(
+                    label = "Shizuku (Shizuku mode only)",
+                    detail = when {
+                        s.captureMode != "shizuku" -> "Not needed: you are using the ${s.captureMode} mode."
+                        !shizukuInstalled -> "Shizuku app is not installed."
+                        !shizukuRunning -> "Installed but not running. Open Shizuku and start it."
+                        else -> "Shizuku is running."
+                    },
+                    state = when {
+                        s.captureMode != "shizuku" -> PermState.NOT_NEEDED
+                        shizukuRunning -> PermState.OK
+                        else -> PermState.MISSING
+                    }
+                )
 
-                if (Build.VERSION.SDK_INT >= 23 && !overlayGranted) {
-                    OutlinedButton(
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
                         onClick = {
-                            try {
-                                ctx.startActivity(
-                                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
-                                        .setPackage(ctx.packageName)
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                )
-                            } catch (t: Throwable) {
-                                Log.e("Config", "open overlay settings: ${t.message}")
-                            }
+                            refreshPerms()
+                            Log.i("Config", "refresh permissions")
                         },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("Grant overlay permission") }
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = accent, contentColor = Color(0xFF001418))
+                    ) { Text("Refresh") }
+
+                    if (Build.VERSION.SDK_INT >= 23 && !overlayGranted) {
+                        OutlinedButton(
+                            onClick = {
+                                try {
+                                    ctx.startActivity(
+                                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                                            .setPackage(ctx.packageName)
+                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    )
+                                } catch (t: Throwable) {
+                                    Log.e("Config", "open overlay settings: ${t.message}")
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Grant overlay") }
+                    }
                 }
+
+                // Plain-language summary so the whole card reads at a glance.
+                val blockers = buildList {
+                    if (!overlayGranted) add("overlay")
+                    if (!notifGranted) add("notifications")
+                    if (s.captureMode == "nonroot" && SessionManager.pendingProjectionData == null)
+                        add("screen capture consent")
+                    if (s.captureMode == "shizuku" && !shizukuRunning) add("Shizuku")
+                }
+                Text(
+                    if (blockers.isEmpty()) "All required permissions are granted."
+                    else "Still needed: ${blockers.joinToString(", ")}.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (blockers.isEmpty()) Color(0xFF4ADE80) else Color(0xFFFBBF24)
+                )
             }
         }
 
@@ -291,6 +331,53 @@ private fun StatusChip(ok: Boolean, muted: Boolean = false) {
             .size(10.dp)
             .background(color, androidx.compose.foundation.shape.CircleShape)
     )
+}
+
+/** Explicit permission states. A bare dot was ambiguous: grey could mean
+ *  granted, denied, or "does not apply to your mode". Words remove the doubt. */
+private enum class PermState { OK, MISSING, NOT_NEEDED }
+
+@Composable
+private fun PermissionRow(label: String, detail: String, state: PermState) {
+    val color = when (state) {
+        PermState.OK -> Color(0xFF4ADE80)
+        PermState.MISSING -> Color(0xFFF87171)
+        PermState.NOT_NEEDED -> Color(0xFF64748B)
+    }
+    val text = when (state) {
+        PermState.OK -> "Granted"
+        PermState.MISSING -> "Not granted"
+        PermState.NOT_NEEDED -> "Not needed"
+    }
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+            Spacer(Modifier.width(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier
+                        .size(8.dp)
+                        .background(color, androidx.compose.foundation.shape.CircleShape)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = color
+                )
+            }
+        }
+        Text(
+            detail,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
 }
 
 // Run a capture probe on a background thread and report the result on the UI thread.

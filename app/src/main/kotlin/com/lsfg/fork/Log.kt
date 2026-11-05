@@ -82,10 +82,37 @@ object Log {
         d(TAG, "log file initialized: ${f.absolutePath}")
     }
 
+    /**
+     * Background writer that KEEPS THE FILE OPEN.
+     *
+     * This used to open a BufferedWriter(FileWriter(f, true)) and close it again
+     * for EVERY log line. That was a real crash cause on this device, not just
+     * inefficiency, so it must not come back:
+     *
+     * The Adreno driver, inside vkQueueSubmit -> gsl_syncobj_destroy, calls
+     * close() on a descriptor it does not own; on this device that is fd 0. An
+     * ordinary stray close(0) is harmless BECAUSE fd 0 is /dev/null. But a
+     * per-line open grabs the LOWEST free descriptor, so the moment the driver
+     * freed fd 0 the log writer claimed fd 0 and Java tagged it as owned by a
+     * FileOutputStream. The driver's next stray close(0) then closed a
+     * Java-owned descriptor, and bionic's fdsan aborted the process:
+     *
+     *   fdsan: attempted to close file descriptor 0 ... actually owned by
+     *   FileOutputStream
+     *   #04 libgsl.so gsl_syncobj_destroy
+     *   #07 vulkan.adreno.so qglinternal::vkQueueSubmit
+     *
+     * Holding ONE handle open for the process lifetime means the log writer
+     * never races to claim fd 0, so the driver's stray close frees only an
+     * already-unowned /dev/null slot and the abort cannot be triggered.
+     */
     private fun startWriter(f: File) {
         if (writerThread != null) return
         shutdown = false
         writerThread = thread(name = "lsfg-log-writer", isDaemon = true) {
+            var w: BufferedWriter? = null
+            var sinceFlush = 0
+
             while (!shutdown) {
                 val line = try {
                     queue.take()
@@ -93,17 +120,29 @@ object Log {
                     if (shutdown) break else continue
                 }
                 try {
-                    val w = BufferedWriter(FileWriter(f, true))
-                    try {
-                        w.write(line)
-                        w.newLine()
-                    } finally {
-                        w.close()
+                    var out = w
+                    if (out == null) {
+                        out = BufferedWriter(FileWriter(f, true))
+                        w = out
+                    }
+                    out.write(line)
+                    out.newLine()
+                    if (++sinceFlush >= 16) {
+                        out.flush()
+                        sinceFlush = 0
                     }
                 } catch (_: Throwable) {
                     // Disk full / IO error: never crash the app for logging.
+                    // Drop the handle so the next line retries a fresh open.
+                    try { w?.close() } catch (_: Throwable) {}
+                    w = null
                 }
             }
+
+            try {
+                w?.flush()
+                w?.close()
+            } catch (_: Throwable) {}
         }
         // Rotate on start: keep at most 8 log files, drop the oldest.
         try {

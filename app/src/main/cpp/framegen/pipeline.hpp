@@ -33,6 +33,10 @@ namespace lsfgvk {
         vk::Image image;
         /// Handle to the Vulkan memory (not owned)
         vk::DeviceMemory memory;
+
+        /// True when this image's memory can be exported as an AHardwareBuffer,
+        /// which is the only cross-VkDevice share that works on Adreno.
+        bool ahbExportable{false};
     };
 
     /// Struct for the uniform buffer

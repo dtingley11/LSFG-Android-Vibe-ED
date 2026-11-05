@@ -12,8 +12,8 @@ android {
         applicationId = "com.lsfg.fork"
         minSdk = 29
         targetSdk = 35
-        versionCode = 12
-        versionName = "1.12"
+        versionCode = 36
+        versionName = "1.36"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }

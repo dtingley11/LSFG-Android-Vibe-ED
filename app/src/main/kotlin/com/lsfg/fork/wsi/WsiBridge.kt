@@ -47,6 +47,25 @@ object WsiBridge {
     external fun nativeFillAhb(ahb: HardwareBuffer, bytes: ByteArray, srcRowStride: Int): Boolean
     external fun nativeFillScaledAhb(ahb: HardwareBuffer, bytes: ByteArray, srcWidth: Int, srcHeight: Int, opaque: Boolean): Boolean
 
+    /**
+     * Import the framegen pipeline's exported destination image by fd.
+     *
+     * FD frame exchange: the presenter reads the pipeline's own image instead of
+     * the framegen copying each frame into an app-allocated HardwareBuffer. That
+     * copy faults inside Adreno's copy helper on this GPU, and reading such a
+     * buffer needs a CPU lock that double-closes an fd under Mesa's fallback
+     * gralloc.
+     *
+     * The caller owns [fd] and must close it after this returns.
+     */
+    external fun nativeImportDstFd(fd: Int, width: Int, height: Int): Boolean
+
+    fun importDstFd(fd: Int, width: Int, height: Int): Boolean = try {
+        nativeImportDstFd(fd, width, height)
+    } catch (_: Throwable) {
+        false
+    }
+
     fun start(windowPtr: Long, width: Int, height: Int, targetFps: Float) =
         nativeStart(windowPtr, width, height, targetFps)
 

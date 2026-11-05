@@ -124,19 +124,50 @@ fun TestScreen() {
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("Status", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 val running = s.running
+                // Honesty fix: "running" only means the session was CREATED. It does
+                // not mean a single frame came out. Previously the box went green
+                // and said "framegen ON" even while the GPU path was deadlocking and
+                // delivering nothing, so a totally broken pipeline looked healthy
+                // and there was no way to tell a pass from a failure.
+                //
+                // Now the colour and the wording track ACTUAL OUTPUT. Zero frames
+                // for a sustained period is reported as a failure, not as success.
+                val producing = running && s.fps > 0.5f
+                val stalled = running && !producing
+                val bg = when {
+                    producing -> Color(0xFF0F2A1A)   // green: frames are flowing
+                    stalled -> Color(0xFF3A1D0F)     // amber: session up, no frames
+                    else -> Color(0xFF1E293B)
+                }
                 Box(
                     Modifier
                         .fillMaxWidth()
-                        .background(if (running) Color(0xFF0F2A1A) else Color(0xFF1E293B), RoundedCornerShape(8.dp))
+                        .background(bg, RoundedCornerShape(8.dp))
                         .padding(12.dp)
                 ) {
                     Text(
-                        if (running) "RUNNING  |  %.0f fps  |  mult x%d  |  framegen %s"
-                            .format(s.fps, s.multiplier, if (s.framegenReady) "ON" else "passthrough")
+                        if (running) "%s  |  %.0f fps  |  mult x%d  |  framegen %s"
+                            .format(
+                                if (producing) "RUNNING" else "NO FRAMES",
+                                s.fps, s.multiplier,
+                                if (s.framegenReady) "ON" else "passthrough"
+                            )
                         else "idle",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
-                        color = if (running) Color(0xFF4ADE80) else MaterialTheme.colorScheme.onSurfaceVariant
+                        color = when {
+                            producing -> Color(0xFF4ADE80)
+                            stalled -> Color(0xFFFBBF24)
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+                }
+                if (stalled) {
+                    Text(
+                        "Nothing is being drawn. The session was created, but the GPU " +
+                        "pipeline is not delivering frames, so a test here has NOT passed.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFFBBF24)
                     )
                 }
                 Text("state: ${s.statusMsg}", style = MaterialTheme.typography.bodySmall,
